@@ -1,0 +1,68 @@
+name: copybot-tick
+
+# Forward-tests copying vetted traders. tick (detect fresh buys) is fast; resolve
+# (settle/mark) is bounded per run. Self-healing — missed runs lose nothing.
+on:
+  schedule:
+    - cron: "11 * * * *"   # two offset triggers so a dropped GitHub run never leaves a
+    - cron: "41 * * * *"   # full-hour gap; concurrency queues them for near-continuous cover
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: copybot
+  cancel-in-progress: false
+
+jobs:
+  copybot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Carry the live SQLite (open copies + decisions + per-trader bankrolls) across
+      # scheduled runs without committing the binary to git history. Cache is ephemeral
+      # but perfect here: the bot is self-healing on new trades, and worst-case a cache
+      # miss just restarts the forward test from the current activity stream.
+      - name: Restore copybot state (DB)
+        uses: actions/cache/restore@v4
+        with:
+          path: copybot.db
+          key: copybot-db-${{ github.run_id }}
+          restore-keys: |
+            copybot-db-
+
+      - name: tick + flush dashboard every ~9 min (resolve + claude + export + commit)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          git config user.name "copybot"
+          git config user.email "bot@users.noreply.github.com"
+          flush(){
+            timeout 200 python3 copybot.py resolve || true
+            timeout 200 python3 copybot.py claude_decide || true
+            python3 copybot.py export || true
+            # Only commit the tiny human-readable dashboard payload. DB lives in cache.
+            git add docs/data.json
+            git diff --staged --quiet || { git commit -m "copybot $(date -u +%FT%TZ)"; \
+              for a in 1 2 3; do git pull --rebase --autostash origin main || true; git push origin HEAD:main && break || sleep 5; done; }
+          }
+          for i in $(seq 1 12); do
+            echo "--- tick $i/12 ($(date -u +%T)) ---"
+            python3 copybot.py tick || true
+            [ $((i % 3)) -eq 0 ] && flush      # flush dashboard every 3 ticks (~9 min)
+            [ "$i" -lt 12 ] && sleep 180
+          done
+          flush
+          python3 copybot.py report || true
+
+      - name: Save copybot state (DB) for next run
+        uses: actions/cache/save@v4
+        with:
+          path: copybot.db
+          key: copybot-db-${{ github.run_id }}

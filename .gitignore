@@ -1,0 +1,19 @@
+# local laptop run artifacts — the cloud is the source of truth now
+cycle.log
+launchd.out.log
+launchd.err.log
+__pycache__/
+*.pyc
+
+# SQLite state (copybot.db especially) is large + high-churn binary.
+# Do NOT track in git — use GitHub Actions cache (see copybot.yml) to carry
+# live DB state between scheduled runs without poisoning history or bloating clones.
+# The public dashboard + research story lives in docs/data.json (small, committed).
+copybot.db
+trades.db
+*.db
+v2_trades.db
+v2_*.db
+
+# If you ever need a historical DB snapshot: check out an old commit before we
+# stopped tracking, or pull the artifact from a recent successful workflow run.

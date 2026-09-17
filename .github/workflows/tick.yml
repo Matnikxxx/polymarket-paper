@@ -1,0 +1,44 @@
+name: paper-trader-tick
+
+# GitHub's cron can run a few minutes late, so we fire several slots around the
+# strategy's :46 and :53 targets. The dedupe guard in paper_trader.py makes sure
+# the same market is never bet twice, so overlapping/late runs are harmless.
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # backfill is self-healing, so exact timing no longer matters
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+permissions:
+  contents: write   # so the job can commit trades.db back to the repo
+
+concurrency:
+  group: tick       # serialize runs so two pushes never collide
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: backfill from price history (self-healing) + report
+        run: |
+          python3 paper_trader.py backfill 48
+          python3 paper_trader.py report
+      - name: persist results
+        run: |
+          git config user.name "polymarket-bot"
+          git config user.email "bot@users.noreply.github.com"
+          # trades.db is no longer committed (see .gitignore + cache pattern in copybot.yml).
+          # The original fade-the-favorite experiment is largely concluded; this workflow
+          # is kept for backfill + occasional report runs only. State is ephemeral per run
+          # or can be re-derived via `paper_trader.py backfill`.
+          if git diff --staged --quiet; then
+            echo "no change this run"
+          else
+            git commit -m "tick $(date -u +%FT%TZ)"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi

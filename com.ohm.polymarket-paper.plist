@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ohm.polymarket-paper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/ohm./projects/in-progress/polymarket-paper/run-cycle.sh</string>
+  </array>
+  <!-- act at :46 and :53 past every hour, exactly like the strategy says -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>46</integer></dict>
+    <dict><key>Minute</key><integer>53</integer></dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>/Users/ohm./projects/in-progress/polymarket-paper/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ohm./projects/in-progress/polymarket-paper/launchd.err.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

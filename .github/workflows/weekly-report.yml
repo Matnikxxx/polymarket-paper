@@ -1,0 +1,33 @@
+name: weekly-report-reminder
+
+# Fires ONCE — 09:00 UTC on June 14, 2026 (one week after launch).
+# Runs the report and opens a GitHub issue with the results. GitHub emails /
+# push-notifies the repo owner on a new issue, so this reaches your phone even
+# if your laptop is closed/offline/traveling.
+on:
+  schedule:
+    - cron: "0 9 14 6 *"   # 09:00 UTC, June 14
+  workflow_dispatch: {}     # also runnable on demand
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build report
+        run: python3 paper_trader.py report | tee report.txt
+      - name: open reminder issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY=$'⏰ One week of paper-trading the AskGina "fade the favorite" strategy is up.\n\nHere is how it actually did — live markets, zero real money:\n\n```\n'"$(cat report.txt)"$'\n```\n\nIf P&L is **positive** across a healthy number of settled bets, the edge might be real — consider funding it.\nIf **negative** (the favorite-longshot prior), you just saved your wallet for $0.\n\nFull data: clone the repo and run `python3 paper_trader.py report`.'
+          gh issue create \
+            --title "📊 Polymarket paper trader — 1 week results ($(date -u +%Y-%m-%d))" \
+            --body "$BODY"
