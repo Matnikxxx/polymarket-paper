@@ -28,7 +28,7 @@ It evolved into this: a cleaner, higher-signal research rig. The rig copies *rea
 - **B (exit +15%)**: take profit at +15% or force-close after 36h. Fast turnover, 1-3 day verdicts. Closed positions currently show strong realized ROI.
 - **C (Claude decides)**: when a position moves ±5-10%, the bot asks Claude Haiku whether to HOLD or SELL. Claude gets live 1h chart context (RSI, trend, momentum, S/R). Conservative by design ("let winners run"). See the live "Claude's decisions" feed on the dashboard for the reason behind each decision.
 - **D (cut losers, ride winners)**: 30% hard stop-loss + trailing stop (arm at +25%, trail 20% off peak). Max 5 days.
-- **E (chart-filtered entry + D exits)**: same exits as D, but with an entry filter. The bot skips entry entirely on a bad 1h 1-min chart. Bad means overbought (RSI>78), a chase (>18% run in 30m), or a strong downtrend. Goal: same upside, fewer garbage copies. (Currently very quiet. The filters are strict on low-liquidity names.)
+- **E (chart-filtered entry + D exits)**: same exits as D, but with an entry filter. The bot skips entry entirely on a bad 1h 1-min chart. Bad means overbought (RSI>78), a chase (30-minute chase filter: rejects an entry if the absolute token-price increase exceeds $0.10 during the checked 30-minute window), or a strong downtrend. Goal: same upside, fewer garbage copies. (Currently very quiet. The filters are strict on low-liquidity names.)
 
 All models recycle capital inside the per-trader $20 wallet. Median detection lag right now is ~4.3 minutes. The rig is deliberately forward-only (no look-ahead).
 
@@ -98,6 +98,61 @@ More data comes first. A model plus a subset of traders must show persistent pos
 - `docs/index.html` + `docs/data.json`: the entire public dashboard (pure static, zero backend, Manrope + quiet dark per the design system)
 - `.github/workflows/copybot.yml`: the reliable near-continuous runner + cache for state
 - `copybot.db` (local only, gitignored): working state for the runner
+
+---
+
+## paper execution assumptions
+
+**This bot is paper-only.** It never signs, submits, or settles anything: no private keys,
+no wallet signing, no order submission, no deposits or withdrawals. It reads public
+Polymarket endpoints and writes rows to a local SQLite file. Nothing here can move money.
+
+Before a detected wallet trade is allowed to become a paper copy, it goes through one
+shared entry/execution simulation (the same gate for **every** model A–E, never per-model):
+
+```
+wallet trade
+  -> simulated detection/copy delay   (COPY_DELAY_SECONDS)
+  -> market price at simulated execution time
+  -> adverse slippage                 (SLIPPAGE_BPS)
+  -> entry price limits               (MIN/MAX_ENTRY_PRICE, on the FINAL price)
+  -> order-book slippage + liquidity gates
+  -> paper fee + share sizing         (PAPER_FEE_BPS)
+  -> paper copy (or a logged rejection)
+```
+
+- **Copy delay is simulated, not a real sleep.** `exec_ts = trade_ts + COPY_DELAY_SECONDS`
+  is timestamp arithmetic used to look up the price at that moment. Ticks and tests run at
+  full speed; nothing ever calls `time.sleep()`.
+- **Slippage is simulated.** `filled = price * (1 + SLIPPAGE_BPS / 10_000)`, always against
+  the copier (a buy fills higher), clamped so a price can never leave `(0, 1)`.
+- **Fees default to zero.** `PAPER_FEE_BPS=0` because this repo does *not* assume or invent
+  a Polymarket fee schedule. Fees are modelled separately from slippage, so you can set a
+  non-zero value later; at `0` the accounting is identical to the previous fee-free runs.
+- **Max/min entry prices are configurable**, and are checked against the *final* simulated
+  buy price. A wallet can buy at 0.798 and still be rejected if delay + slippage push our
+  simulated fill above `MAX_ENTRY_PRICE`.
+- **Rejected trades are logged**, never silently dropped. Every candidate gets a row in
+  `entry_filter_log` with an explicit reason (`ACCEPTED`, `PRICE_TOO_HIGH`, `PRICE_TOO_LOW`,
+  `INVALID_PRICE`, `SLIPPAGE_TOO_HIGH`, `INSUFFICIENT_LIQUIDITY`, `DUPLICATE`, …) plus the
+  full execution trail: wallet price, market price, slippage amount, final entry, fee,
+  stake, shares, and detection delay. `copybot report` and the dashboard summarise it.
+
+Configure via a `.env` file next to `copybot.py` (see `.env.example`) or real environment
+variables, which win over `.env`:
+
+```
+MAX_ENTRY_PRICE=0.80
+MIN_ENTRY_PRICE=0.05
+COPY_DELAY_SECONDS=30
+SLIPPAGE_BPS=50
+PAPER_FEE_BPS=0
+```
+
+**These assumptions are for research.** They are a model of copying conditions, not a
+promise about live execution — real fills depend on the book at the moment of the trade,
+queue position, and fees that this repo deliberately does not guess at. Paper results
+under these settings do not guarantee live results.
 
 ---
 

@@ -123,6 +123,67 @@ def get(url):
         return json.loads(r.read().decode())
 
 
+# ---- config helpers: .env + env-var overrides for tunable constants ----
+# Matches the repo's existing pattern (module-level ALL_CAPS constants edited to fork
+# behavior, e.g. TAKE_PROFIT/STOP_LOSS above) while also letting the values below be
+# tuned from the environment (the same mechanism already used for ANTHROPIC_API_KEY)
+# without touching any Python logic — e.g. `MAX_ENTRY_PRICE=0.60 python3 copybot.py tick`.
+# This is ONE configuration system with two front-doors into the same os.environ:
+# a `.env` file next to copybot.py (loaded below), and real environment variables,
+# which win over `.env` so CI/one-off overrides still work.
+def _load_dotenv(path=None):
+    """Minimal KEY=VALUE .env reader (stdlib only, no new dependency). Never overrides a
+    variable already present in the real environment. Missing/unreadable file is a no-op."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+    except OSError:
+        return {}
+    loaded = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        if k and k not in os.environ:      # real env wins over .env
+            os.environ[k] = v
+            loaded[k] = v
+    return loaded
+
+
+_load_dotenv()
+
+
+def _env_float(name, default):
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return float(v)
+    except ValueError:
+        return default
+
+
+def _env_int(name, default):
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return int(float(v))
+    except ValueError:
+        return default
+
+
+def _env_bool(name, default):
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+
 def chart_signal(token_id):
     """Fetch last 1h of price + volume data for a Polymarket token.
 
@@ -139,7 +200,13 @@ def chart_signal(token_id):
         return None
     if len(hist) < 20:
         return None
-    prices = [float(h["p"]) for h in hist]
+    try:
+        prices = [float(h["p"]) for h in hist]
+    except (ValueError, TypeError, KeyError):
+        # One or more candles have a non-numeric or missing price field.
+        # Return a sentinel so _chart_entry_ok can produce a specific reason
+        # rather than letting an uncaught exception crash the tick loop.
+        return {"_error": "invalid_candle_data", "bars": len(hist)}
     n = len(prices)
 
     # Linear regression slope (per minute → per hour)
@@ -234,11 +301,21 @@ def chart_signal(token_id):
 def _chart_entry_ok(sig, entry):
     """Return (ok: bool, reason: str). False = skip this Model E entry.
 
+    Fail-closed policy (Phase 6):
+      - sig is None        → required price history unavailable → reject
+      - sig has '_error'   → price data malformed → reject with specific reason
+      - volume keys absent → volume gate is skipped; price rules still apply
+
     Price filters: RSI overbought, chasing 30m spike, strong downtrend.
     Volume filters: volume drying up (vol_ratio < 0.3) signals conviction is fading.
     """
+    if sig is None:
+        return False, "insufficient_price_history"
+    error = sig.get("_error") if isinstance(sig, dict) else None
+    if error:
+        return False, error
     if not sig:
-        return True, ""
+        return False, "insufficient_price_history"
     rsi    = sig["rsi"]
     mom_30 = sig["mom_30m"]
     trend  = sig["trend_ph"]
@@ -288,6 +365,42 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS trader_cat_stats(
         trader TEXT, category TEXT, trades INTEGER, wins INTEGER, realized REAL,
         last_ts TEXT, PRIMARY KEY(trader, category))""")
+    # Entry-filter audit log: one row per unique source trade considered (keyed like
+    # `copies` but WITHOUT the :model suffix, since the new filters are per-trade, not
+    # per-model), whether accepted or rejected. Powers FILTER_SUMMARY / dashboard.
+    c.execute("""CREATE TABLE IF NOT EXISTS entry_filter_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, ts TEXT, wallet TEXT,
+        asset TEXT, condition_id TEXT, title TEXT, entry_price REAL,
+        detection_lag REAL, slippage REAL, liquidity_usd REAL,
+        accepted INTEGER, reason TEXT)""")
+    # --- migration (additive only; no drops, no rewrites, no data loss) ---
+    # Execution-simulation audit columns. Pre-existing rows keep their values and simply
+    # read NULL for these, which the report/dashboard already tolerate.
+    for col in ("wallet_price REAL", "detected_ts INTEGER", "exec_ts INTEGER",
+                "copy_delay_sec INTEGER", "price_source TEXT", "market_price REAL",
+                "slippage_bps REAL", "slippage_amount REAL", "fee_bps REAL", "fee REAL",
+                "stake REAL", "shares REAL"):
+        try:
+            c.execute(f"ALTER TABLE entry_filter_log ADD COLUMN {col}")
+        except Exception:
+            pass
+    # Chart-filter audit log: one row per Model E chart-gate decision (accepted and
+    # rejected).  Persists what was previously ephemeral (the skipped_chart counter).
+    c.execute("""CREATE TABLE IF NOT EXISTS chart_filter_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, asset TEXT, decision INTEGER, reason TEXT,
+        price_data_ok INTEGER, volume_data_ok INTEGER,
+        rsi REAL, mom_30m REAL, trend_ph REAL,
+        vol_ratio REAL, buy_pressure REAL)""")
+
+    # Same idea on `copies`, so an accepted paper position carries its own execution
+    # provenance without needing a join. `their_price` (wallet price) and `entry` (final
+    # simulated buy price) already exist and keep their meaning.
+    for col in ("exec_ts INTEGER", "market_price REAL", "fee REAL"):
+        try:
+            c.execute(f"ALTER TABLE copies ADD COLUMN {col}")
+        except Exception:
+            pass
     return c
 
 
@@ -303,6 +416,116 @@ def _cash(c, model, trader):
 
 def _credit(c, model, trader, amount):
     c.execute("UPDATE bankroll SET cash=cash+? WHERE model=? AND trader=?", (amount, model, trader))
+
+
+def _log_filter_event(c, key, wallet, asset, cid, title, entry_price, filt):
+    """Persist one entry_filter_log row capturing the full simulated execution — accepted
+    or rejected, every candidate gets a row with an explicit reason. Idempotent: INSERT OR
+    IGNORE on the same key, so re-seeing an unaged trade across ticks can't double-count."""
+    try:
+        c.execute("""INSERT OR IGNORE INTO entry_filter_log(
+            key, ts, wallet, asset, condition_id, title, entry_price,
+            detection_lag, slippage, liquidity_usd, accepted, reason,
+            wallet_price, detected_ts, exec_ts, copy_delay_sec, price_source,
+            market_price, slippage_bps, slippage_amount, fee_bps, fee, stake, shares)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (key, now_iso(), wallet, asset, cid, (title or "")[:80],
+             filt.get("entry_price", entry_price),
+             filt["detection_lag"], filt["slippage"], filt["liquidity_usd"],
+             1 if filt["accepted"] else 0, filt["reason"],
+             filt.get("wallet_price"), filt.get("detected_ts"), filt.get("exec_ts"),
+             filt.get("copy_delay_sec"), filt.get("price_source"),
+             filt.get("market_price"), filt.get("slippage_bps"),
+             filt.get("slippage_amount"), filt.get("fee_bps"), filt.get("fee"),
+             filt.get("stake"), filt.get("shares")))
+    except Exception:
+        pass
+
+
+def _canonical_reason(reason):
+    """Map legacy reason names onto the current constants (see LEGACY_REASON_ALIASES)."""
+    return LEGACY_REASON_ALIASES.get(reason, reason)
+
+
+def _log_chart_filter_event(c, asset, ok, reason, sig):
+    """Persist one chart_filter_log row for every Model E chart-gate evaluation.
+
+    This replaces the ephemeral skipped_chart counter with a durable, auditable record.
+    Silently suppressed on any DB error so a logging failure can't crash the tick.
+    """
+    try:
+        price_data_ok = 0 if (sig is None or (isinstance(sig, dict) and sig.get("_error"))) else 1
+        volume_data_ok = 1 if (isinstance(sig, dict) and "vol_ratio" in sig and "buy_pressure" in sig) else 0
+        rsi         = sig.get("rsi")         if isinstance(sig, dict) else None
+        mom_30m     = sig.get("mom_30m")     if isinstance(sig, dict) else None
+        trend_ph    = sig.get("trend_ph")    if isinstance(sig, dict) else None
+        vol_ratio   = sig.get("vol_ratio")   if isinstance(sig, dict) else None
+        buy_pressure= sig.get("buy_pressure")if isinstance(sig, dict) else None
+        c.execute("""INSERT INTO chart_filter_log(
+            ts, asset, decision, reason,
+            price_data_ok, volume_data_ok,
+            rsi, mom_30m, trend_ph, vol_ratio, buy_pressure)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (now_iso(), asset, 1 if ok else 0, reason,
+             price_data_ok, volume_data_ok,
+             rsi, mom_30m, trend_ph, vol_ratio, buy_pressure))
+    except Exception:
+        pass
+
+
+def _filter_summary(c):
+    """Aggregate entry_filter_log into the numbers report()/export() display."""
+    row = c.execute("SELECT COUNT(*), COALESCE(SUM(accepted),0) FROM entry_filter_log").fetchone()
+    total, accepted = (row[0] or 0), (row[1] or 0)
+    skipped = total - accepted
+    reasons = {r: 0 for r in SKIP_REASONS}
+    for reason, cnt in c.execute(
+            "SELECT reason, COUNT(*) FROM entry_filter_log WHERE accepted=0 GROUP BY reason"):
+        canon = _canonical_reason(reason)
+        if canon in reasons:
+            reasons[canon] += cnt
+        else:
+            reasons["OTHER_FILTER"] += cnt
+    lags = sorted(r[0] for r in c.execute(
+        "SELECT detection_lag FROM entry_filter_log WHERE detection_lag IS NOT NULL").fetchall())
+    avg_lag = round(sum(lags) / len(lags), 1) if lags else None
+    med_lag = round(lags[len(lags) // 2], 1) if lags else None
+    # Execution stats over accepted copies only (what we actually "paid").
+    ex = c.execute("""SELECT AVG(slippage_amount), COALESCE(SUM(fee),0), AVG(fee)
+                      FROM entry_filter_log WHERE accepted=1""").fetchone()
+    avg_slip_amt = round(ex[0], 6) if ex and ex[0] is not None else None
+    total_fees = round(ex[1], 6) if ex and ex[1] is not None else 0.0
+    return {"total": total, "accepted": accepted, "skipped": skipped, "reasons": reasons,
+            "acceptance_rate": round(accepted / total, 4) if total else None,
+            "avg_detection_lag_sec": avg_lag, "median_detection_lag_sec": med_lag,
+            "avg_slippage_amount": avg_slip_amt, "total_paper_fees": total_fees}
+
+
+def record_paper_copy(c, base_key, wallet, their_ts, cid, asset, title, outcome, oidx,
+                       their_price, entry, stake, shares, model, exec_ts=None,
+                       market_price=None, fee=0.0):
+    """Insert exactly one `copies` row for (base_key, model) — the same insert tick()
+    already did inline, extracted so it's independently testable ('accepted trade creates
+    exactly one paper position', 'rejection creates none'). Returns True iff a row was
+    inserted; False on dedupe-hit or insufficient per-model bankroll (unchanged existing
+    behavior, just no longer duplicated per model).
+
+    `entry` is the FINAL simulated buy price (post delay + slippage); `their_price` stays
+    the copied wallet's own price; `market_price` is the pre-slippage price; `fee` is the
+    paper fee (0.0 by default, so bankroll maths is unchanged from before)."""
+    key = f"{base_key}:{model}"
+    if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
+        return False
+    if _cash(c, model, wallet) < stake:   # this trader's OWN $20 wallet for this model
+        return False
+    c.execute("""INSERT OR IGNORE INTO copies(key,copied_ts,wallet,their_ts,condition_id,
+        asset,title,outcome,outcome_index,their_price,entry,stake,shares,status,model,
+        exec_ts,market_price,fee)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (key, now_iso(), wallet, their_ts, cid, asset, (title or "")[:80], outcome, oidx,
+         their_price, entry, stake, shares, "open", model, exec_ts, market_price, fee))
+    _credit(c, model, wallet, -stake)     # lock stake out of THIS trader's wallet
+    return True
 
 
 _endcache = {}
@@ -350,6 +573,286 @@ def _is_fast_market(title):
     t = (title or "").lower()
     return any(p in t for p in FAST_MARKET_PATTERNS)
 
+
+# === Entry / execution simulation (PAPER ONLY — simulated, never submitted anywhere) ===
+# All tunable from .env or the environment; see .env.example and the README section
+# "Paper execution assumptions".
+# Rejects anything strictly ABOVE this, so 0.80 is still eligible and 0.81 / 0.90 are
+# rejected. Checked against the FINAL simulated buy price (after delay + slippage),
+# not the wallet's own fill price. Single source of truth for the setting.
+MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.80)   # reject copies priced above this
+MIN_ENTRY_PRICE = _env_float("MIN_ENTRY_PRICE", 0.05)   # reject copies priced below this
+# Simulated detection/copy delay in seconds. This is arithmetic on timestamps
+# (exec_ts = source_ts + COPY_DELAY_SECONDS) used to look up the market price at the
+# simulated execution moment — it is NEVER a real time.sleep(), so ticks and tests run
+# at full speed.
+COPY_DELAY_SECONDS = _env_int("COPY_DELAY_SECONDS", 30)
+# Simulated adverse slippage on entry, in basis points (50 = 0.50%). Applied against the
+# copier: a BUY fills HIGHER than the market price. Kept separate from PAPER_FEE_BPS.
+SLIPPAGE_BPS = _env_float("SLIPPAGE_BPS", 50.0)
+# Paper fee in basis points, charged on stake. Defaults to 0 deliberately: this repo does
+# NOT assume or invent a Polymarket fee schedule. At 0 the maths is identical to the
+# previous fee-free behavior. Set it later if you want to model a fee.
+PAPER_FEE_BPS = _env_float("PAPER_FEE_BPS", 0.0)
+
+# Slippage: reuse the project's OWN orderbook-walk definition of slippage (see
+# paper_trader.simulate_buy: walk CLOB asks to fill a stake, slippage = (avg_fill-best_ask)/
+# best_ask). 4% is not a new invented number — it is literally that file's existing
+# MAX_SLIPPAGE, i.e. the slippage this repo already treats as acceptable for a real market
+# buy. We default to the same figure here rather than invent a copybot-specific one.
+# NOTE: this is the *observed book* slippage gate and is distinct from SLIPPAGE_BPS, which
+# is the modelled cost actually applied to the simulated fill price.
+MAX_SLIPPAGE = _env_float("MAX_SLIPPAGE", 0.04)
+# Recommended default: if we can't walk the book (fetch failed / book too thin to fill our
+# stake at any price), treat it the same way paper_trader.py already does — as unfillable —
+# and reject rather than silently assume a good fill.
+REJECT_IF_SLIPPAGE_UNKNOWN = _env_bool("REJECT_IF_SLIPPAGE_UNKNOWN", True)
+# Liquidity: derived from the SAME CLOB order book fetched for the slippage walk (no
+# separate/fabricated metric) — total resting $ notional (price*size) across all ask
+# levels. STAKE is $2/copy; requiring 10x STAKE of resting ask depth keeps our copy from
+# being a large fraction of the visible book.
+MIN_LIQUIDITY = _env_float("MIN_LIQUIDITY", STAKE * 10)
+# Symmetric with REJECT_IF_SLIPPAGE_UNKNOWN: if the book can't tell us liquidity, don't
+# assume it's fine.
+REJECT_IF_LIQUIDITY_UNKNOWN = _env_bool("REJECT_IF_LIQUIDITY_UNKNOWN", True)
+# Detection lag: paper_copy_timestamp - source_trade_timestamp. The repo already treats
+# "trade older than 15 min when we see it" as too stale to copy fairly (MAX_TRADE_AGE_SEC
+# above) — MAX_DETECTION_LAG_SECONDS reuses that exact figure as its default rather than
+# inventing a new one; it's evaluated as its own filter (with its own reason/counter) so
+# it stays tunable independently of MAX_TRADE_AGE_SEC.
+MAX_DETECTION_LAG_SECONDS = _env_float("MAX_DETECTION_LAG_SECONDS", MAX_TRADE_AGE_SEC)
+
+# Audit-log reason constants. ACCEPTED is recorded on accepted candidates so every
+# candidate has an explicit, non-vague outcome.
+REASON_ACCEPTED = "ACCEPTED"
+SKIP_REASONS = ("PRICE_TOO_HIGH", "PRICE_TOO_LOW", "INVALID_PRICE", "SLIPPAGE_TOO_HIGH",
+                "SLIPPAGE_UNKNOWN", "INSUFFICIENT_LIQUIDITY", "LIQUIDITY_UNKNOWN",
+                "DETECTION_LAG_TOO_HIGH", "DUPLICATE", "OTHER_FILTER")
+# Rows written by the previous revision used older names. Mapping them keeps historical
+# paper results readable in the report/dashboard instead of silently falling into
+# OTHER_FILTER — no data is rewritten or deleted.
+LEGACY_REASON_ALIASES = {
+    "ENTRY_PRICE_ABOVE_MAX": "PRICE_TOO_HIGH",
+    "ENTRY_PRICE_BELOW_MIN": "PRICE_TOO_LOW",
+    "LIQUIDITY_TOO_LOW": "INSUFFICIENT_LIQUIDITY",
+}
+
+
+def _price_at(token_id, ts):
+    """Market price for `token_id` at (or immediately before) unix time `ts`, from the
+    CLOB prices-history endpoint the project already uses in chart_signal().
+
+    This is how the simulated copy delay becomes a real price difference: we ask for the
+    price at source_ts + COPY_DELAY_SECONDS instead of the price the wallet got.
+    Returns None if history is unavailable or has no bar at/before ts — the caller then
+    falls back to the current market price rather than fabricating one.
+    """
+    if not token_id or ts is None:
+        return None
+    try:
+        data = get(f"{CLOB}/prices-history?market={token_id}"
+                   f"&startTs={int(ts) - 900}&endTs={int(ts) + 60}&fidelity=1")
+        hist = data.get("history", [])
+    except Exception:
+        return None
+    at_or_before = [h for h in hist if int(h.get("t", 0)) <= int(ts)]
+    if not at_or_before:
+        return None
+    try:
+        return float(max(at_or_before, key=lambda h: int(h["t"]))["p"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def apply_slippage(price, slippage_bps=None):
+    """Adverse entry slippage for a BUY, in basis points (1 bp = 0.01%).
+
+        filled_price = price * (1 + slippage_bps / 10_000)
+
+    The copier always fills WORSE (higher) than the market price, never better. The
+    result is clamped into the valid probability range (0.0, 1.0) exclusive, so a
+    slippage-inflated price can never become an invalid (>=1.0) share price.
+    Returns (filled_price, slippage_amount). 0 bps returns the price unchanged.
+    """
+    bps = SLIPPAGE_BPS if slippage_bps is None else slippage_bps
+    filled = price * (1.0 + bps / 10_000.0)
+    filled = min(max(filled, 1e-6), 0.999999)
+    return filled, filled - price
+
+
+def apply_fee(stake, fee_bps=None):
+    """Paper fee charged on stake, in basis points, kept entirely separate from slippage.
+
+        fee = stake * fee_bps / 10_000
+
+    Defaults to PAPER_FEE_BPS, which is 0: this project does NOT assume a Polymarket fee
+    schedule. At 0 bps fee == 0.0 and the remaining stake is unchanged, so accounting is
+    byte-identical to the previous fee-free behavior.
+    Returns (fee, stake_after_fee).
+    """
+    bps = PAPER_FEE_BPS if fee_bps is None else fee_bps
+    fee = stake * bps / 10_000.0
+    return fee, stake - fee
+
+
+def _fetch_book(token_id):
+    """Fetch the live CLOB order book for a token. Returns the raw dict, or None if it
+    can't be fetched (network error, bad token, etc.) — callers must treat None as
+    'unknown', never as 'empty'."""
+    if not token_id:
+        return None
+    try:
+        return get(f"{CLOB}/book?token_id={token_id}")
+    except Exception:
+        return None
+
+
+def _walk_book_for_stake(asks, stake):
+    """Walk asks (ascending price) to fill `stake` USD, exactly like
+    paper_trader.simulate_buy. Returns (avg_price, slippage) or (None, None) if the book
+    is empty or too thin to fill `stake` at any price (treated as unknown/unfillable,
+    matching that function's existing convention)."""
+    if not asks:
+        return None, None
+    asks = sorted(asks, key=lambda a: a["price"])
+    best = asks[0]["price"]
+    if best <= 0:
+        return None, None
+    remaining, shares = stake, 0.0
+    for lvl in asks:
+        lvl_cost = lvl["price"] * lvl["size"]
+        take = min(remaining, lvl_cost)
+        if lvl["price"] > 0:
+            shares += take / lvl["price"]
+        remaining -= take
+        if remaining <= 1e-9:
+            break
+    if remaining > 1e-6 or shares <= 0:
+        return None, None
+    avg = stake / shares
+    return avg, (avg - best) / best
+
+
+def _book_liquidity_usd(asks):
+    """Total resting $ notional (price*size) across all ask levels of an already-fetched
+    book — an honest sum of data already in the payload, not a fabricated metric.
+    Returns None if we don't even have a parsed ask list (unknown), 0.0 for a genuinely
+    empty book (known, just zero)."""
+    if asks is None:
+        return None
+    return round(sum(a["price"] * a["size"] for a in asks), 2)
+
+
+def evaluate_entry_filters(market_price, source_ts, now_ts, book, wallet_price=None,
+                           exec_price=None, stake=None):
+    """Simulate copying one wallet trade and decide whether it may become a paper copy.
+
+    PAPER ONLY: nothing here signs, submits or settles anything — it computes what a copy
+    *would* have cost under the configured assumptions.
+
+    Pipeline (the order matters, and is the order required by the spec):
+        wallet trade
+          -> simulated detection/copy delay   (exec_ts = source_ts + COPY_DELAY_SECONDS)
+          -> market price at simulated execution time  (`exec_price`, else `market_price`)
+          -> adverse slippage                 (SLIPPAGE_BPS)
+          -> entry price limits               (MIN/MAX_ENTRY_PRICE, on the FINAL price)
+          -> book slippage / liquidity gates  (pre-existing, unchanged)
+          -> paper fee + share sizing         (PAPER_FEE_BPS)
+
+    Args:
+        market_price: current market price for the outcome (fallback if no exec price).
+        source_ts:    unix ts of the wallet's original trade, or None if unknown.
+        now_ts:       unix ts at detection ("paper_copy_timestamp").
+        book:         raw CLOB order book dict with an "asks" list, or None if unavailable.
+        wallet_price: the price the copied wallet itself got (recorded for audit only —
+                      never used for the MAX_ENTRY_PRICE decision).
+        exec_price:   market price observed at exec_ts (from _price_at). None -> fall back
+                      to market_price, which is recorded via price_source.
+        stake:        stake to size the copy with; defaults to STAKE.
+
+    Returns a dict with the full execution audit trail. `accepted` is a bool and `reason`
+    is always set: REASON_ACCEPTED on success, otherwise exactly one SKIP_REASONS value
+    (checks stop at the first failure, which keeps accepted+skipped and the per-reason
+    counters consistent).
+    """
+    stake = STAKE if stake is None else stake
+    detection_lag = (now_ts - source_ts) if source_ts is not None else None
+    exec_ts = (source_ts + COPY_DELAY_SECONDS) if source_ts is not None else None
+    # Price the delay lands us on: the post-delay quote when we have one, else the current
+    # market price. price_source records which, so the audit trail never overstates.
+    price_source = "exec_ts_history" if exec_price is not None else "current_market"
+    pre_slip = exec_price if exec_price is not None else market_price
+
+    base = {"wallet_price": wallet_price, "detected_ts": now_ts, "exec_ts": exec_ts,
+            "copy_delay_sec": COPY_DELAY_SECONDS, "detection_lag": detection_lag,
+            "price_source": price_source, "market_price": pre_slip,
+            "slippage_bps": SLIPPAGE_BPS, "slippage_amount": None, "entry_price": None,
+            "fee_bps": PAPER_FEE_BPS, "fee": None, "stake": stake, "shares": None,
+            "slippage": None, "liquidity_usd": None}
+
+    def result(accepted, reason, **over):
+        out = dict(base, accepted=accepted, reason=reason)
+        out.update(over)
+        return out
+
+    # --- price must be a usable probability before anything else is computed ---
+    try:
+        pre_slip = float(pre_slip)
+    except (TypeError, ValueError):
+        return result(False, "INVALID_PRICE")
+    if not (0.0 < pre_slip < 1.0):
+        return result(False, "INVALID_PRICE", market_price=pre_slip)
+    base["market_price"] = pre_slip
+
+    # --- simulated adverse slippage, applied BEFORE the entry-price limits ---
+    final_price, slip_amt = apply_slippage(pre_slip)
+    base["slippage_amount"] = round(slip_amt, 6)
+    base["entry_price"] = round(final_price, 6)
+    if not (0.0 < final_price < 1.0):        # defensive; apply_slippage already clamps
+        return result(False, "INVALID_PRICE")
+
+    # --- entry price limits, on the FINAL simulated buy price ---
+    # A wallet that bought at 0.79 can still be rejected here if delay+slippage push our
+    # simulated fill above MAX_ENTRY_PRICE. That is the point of the ordering.
+    if final_price > MAX_ENTRY_PRICE:
+        return result(False, "PRICE_TOO_HIGH")
+    if final_price < MIN_ENTRY_PRICE:
+        return result(False, "PRICE_TOO_LOW")
+
+    if detection_lag is not None and detection_lag > MAX_DETECTION_LAG_SECONDS:
+        return result(False, "DETECTION_LAG_TOO_HIGH")
+
+    # --- pre-existing observed-book gates (unchanged behavior) ---
+    asks = None
+    if book is not None:
+        try:
+            asks = [{"price": float(a["price"]), "size": float(a["size"])}
+                    for a in book.get("asks", [])]
+        except Exception:
+            asks = None
+
+    _, slippage = _walk_book_for_stake(asks, stake)
+    liquidity_usd = _book_liquidity_usd(asks)
+    base["slippage"], base["liquidity_usd"] = slippage, liquidity_usd
+
+    if slippage is None:
+        if REJECT_IF_SLIPPAGE_UNKNOWN:
+            return result(False, "SLIPPAGE_UNKNOWN")
+    elif slippage > MAX_SLIPPAGE:
+        return result(False, "SLIPPAGE_TOO_HIGH")
+
+    if liquidity_usd is None:
+        if REJECT_IF_LIQUIDITY_UNKNOWN:
+            return result(False, "LIQUIDITY_UNKNOWN")
+    elif liquidity_usd < MIN_LIQUIDITY:
+        return result(False, "INSUFFICIENT_LIQUIDITY")
+
+    # --- accepted: size the paper position (fee separate from slippage) ---
+    fee, stake_after_fee = apply_fee(stake)
+    return result(True, REASON_ACCEPTED, fee=round(fee, 6),
+                  shares=stake_after_fee / final_price)
+
+
 # === SDD v2 Category + Quality helpers ===
 def _get_trader_cat_quality(c, trader, category):
     row = c.execute("SELECT trades, wins, realized FROM trader_cat_stats WHERE trader=? AND category=?",
@@ -380,8 +883,13 @@ def tick():
     now = int(time.time())
     added = 0
     skipped_chart = 0
+    skipped_filters = 0
+    skipped_dupes = 0
     mkt_cache = {}    # condition_id -> gamma market data
     chart_cache = {}  # asset (token_id) -> chart_signal result
+    book_cache = {}   # asset (token_id) -> _fetch_book() result (for entry filters)
+    exec_cache = {}   # (asset, exec_ts) -> market price at simulated execution time
+    seen_keys = set()  # candidate keys already evaluated in THIS run (duplicate guard)
     for name, addr in WALLETS.items():
         try:
             act = get(f"{DATA}/activity?user={addr}&limit=100")
@@ -417,7 +925,40 @@ def tick():
             if entry <= 0.02 or entry >= 0.98:   # already (near) resolved -> no fair copy
                 continue
             base = f"{tx}:{asset}:{a.get('timestamp')}"
-            shares = STAKE / entry
+
+            # === Entry / execution simulation (price / slippage / liquidity / lag) ===
+            # Per-TRADE, not per-model: a bad entry is bad for every model equally, so we
+            # gate once here, before any model-specific position is created. Models A-E
+            # then all receive the SAME accepted trade at the SAME simulated fill.
+            if base in seen_keys:
+                skipped_dupes += 1
+                continue  # DUPLICATE candidate within this run — never copied twice
+            seen_keys.add(base)
+            try:
+                source_ts = int(a.get("timestamp"))
+            except (TypeError, ValueError):
+                source_ts = None
+            if asset not in book_cache:
+                book_cache[asset] = _fetch_book(asset)
+            # Simulated copy delay: look up the price at source_ts + COPY_DELAY_SECONDS.
+            # Pure timestamp arithmetic + a history lookup — no real sleep anywhere.
+            exec_price = None
+            if source_ts is not None and COPY_DELAY_SECONDS:
+                ek = (asset, source_ts + COPY_DELAY_SECONDS)
+                if ek not in exec_cache:
+                    exec_cache[ek] = _price_at(asset, source_ts + COPY_DELAY_SECONDS)
+                exec_price = exec_cache[ek]
+            filt = evaluate_entry_filters(entry, source_ts, now, book_cache[asset],
+                                          wallet_price=their_price, exec_price=exec_price)
+            _log_filter_event(c, base, name, asset, cid, a.get("title"), entry, filt)
+            if not filt["accepted"]:
+                skipped_filters += 1
+                continue  # rejected — no paper position for this trade, in any model
+
+            # Final simulated buy price (post delay + slippage) and fee-adjusted sizing.
+            entry = filt["entry_price"]
+            shares = filt["shares"]
+
             # Model A (hold) only for markets resolving within 3 days
             hold_ok = False
             try:
@@ -444,25 +985,20 @@ def tick():
                     continue
                 if model == "chart":
                     ok, reason = _chart_entry_ok(sig, entry)
+                    _log_chart_filter_event(c, asset, ok, reason, sig)
                     if not ok:
                         skipped_chart += 1
                         continue  # chart says skip this entry
-                key = f"{base}:{model}"
-                if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
-                    continue
-                if _cash(c, model, name) < STAKE:   # this trader's OWN $20 wallet for this model
-                    continue
-                c.execute("""INSERT OR IGNORE INTO copies(key,copied_ts,wallet,their_ts,condition_id,
-                    asset,title,outcome,outcome_index,their_price,entry,stake,shares,status,model)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (key, now_iso(), name, a.get("timestamp"), a.get("conditionId"), asset,
-                     (a.get("title") or "")[:80], a.get("outcome"), a.get("outcomeIndex"),
-                     their_price, entry, STAKE, shares, "open", model))
-                _credit(c, model, name, -STAKE)     # lock stake out of THIS trader's wallet
-                added += 1
+                if record_paper_copy(c, base, name, a.get("timestamp"), a.get("conditionId"),
+                                      asset, a.get("title"), a.get("outcome"),
+                                      a.get("outcomeIndex"), their_price, entry, STAKE,
+                                      shares, model, exec_ts=filt["exec_ts"],
+                                      market_price=filt["market_price"], fee=filt["fee"]):
+                    added += 1
         c.commit()
     print(f"tick: recorded {added} new paper copies across {len(WALLETS)} wallets "
-          f"(chart filtered {skipped_chart} entries)")
+          f"(chart filtered {skipped_chart} entries, entry-filter rejected "
+          f"{skipped_filters} trades, {skipped_dupes} duplicates)")
 
 
 def _market_by_condition(cid):
@@ -759,11 +1295,66 @@ def export():
         "wallets": len(WALLETS),
         "open_risk": round(total_at_risk, 2),
         "claude_calls_24h": recent_claude,
-        "note": "E entry filter: RSI>78 or 30m momentum/entry >18%"
+        "note": "E entry filter: RSI>78 or 30m absolute price increase >$0.10"
     }
 
+    fs = _filter_summary(c)
+    # Recent accepted copies, with enough detail to audit the simulated execution.
+    recent_accepted = [
+        dict(zip(("ts", "wallet", "title", "wallet_price", "market_price", "entry_price",
+                  "slippage_amount", "fee", "stake", "shares", "detection_lag",
+                  "exec_ts", "price_source"), r))
+        for r in c.execute("""SELECT ts, wallet, title, wallet_price, market_price,
+            entry_price, slippage_amount, fee, stake, shares, detection_lag, exec_ts,
+            price_source FROM entry_filter_log WHERE accepted=1
+            ORDER BY id DESC LIMIT 25""").fetchall()]
+    recent_rejected = [
+        dict(zip(("ts", "wallet", "title", "reason", "market_price", "entry_price"), r))
+        for r in c.execute("""SELECT ts, wallet, title, reason, market_price, entry_price
+            FROM entry_filter_log WHERE accepted=0 ORDER BY id DESC LIMIT 25""").fetchall()]
+    filters = {
+        "max_entry_price": MAX_ENTRY_PRICE, "min_entry_price": MIN_ENTRY_PRICE,
+        "copy_delay_seconds": COPY_DELAY_SECONDS, "slippage_bps": SLIPPAGE_BPS,
+        "paper_fee_bps": PAPER_FEE_BPS,
+        "max_slippage": MAX_SLIPPAGE, "min_liquidity": MIN_LIQUIDITY,
+        "max_detection_lag_seconds": MAX_DETECTION_LAG_SECONDS,
+        "reject_if_slippage_unknown": REJECT_IF_SLIPPAGE_UNKNOWN,
+        "reject_if_liquidity_unknown": REJECT_IF_LIQUIDITY_UNKNOWN,
+        "candidates": fs["total"], "accepted": fs["accepted"], "skipped": fs["skipped"],
+        "acceptance_rate": fs["acceptance_rate"], "reasons": fs["reasons"],
+        "avg_detection_lag_sec": fs["avg_detection_lag_sec"],
+        "median_detection_lag_sec": fs["median_detection_lag_sec"],
+        "avg_slippage_amount": fs["avg_slippage_amount"],
+        "total_paper_fees": fs["total_paper_fees"],
+        "recent_accepted": recent_accepted, "recent_rejected": recent_rejected,
+    }
+
+    # Chart-filter audit summary for docs/data.json
+    cfl = c.execute("""SELECT COUNT(*), COALESCE(SUM(decision),0),
+        COALESCE(SUM(CASE WHEN price_data_ok=0 THEN 1 ELSE 0 END),0),
+        COALESCE(SUM(CASE WHEN volume_data_ok=1 THEN 1 ELSE 0 END),0)
+        FROM chart_filter_log""").fetchone()
+    chart_filter_summary = {
+        "total_evaluations": cfl[0] or 0,
+        "accepted": cfl[1] or 0,
+        "rejected": (cfl[0] or 0) - (cfl[1] or 0),
+        "rejected_no_price_data": cfl[2] or 0,
+        "evaluations_with_volume": cfl[3] or 0,
+        "fail_closed_policy": "price_required_volume_optional",
+    }
+    recent_chart = [
+        dict(zip(("ts", "asset", "decision", "reason",
+                  "price_data_ok", "volume_data_ok",
+                  "rsi", "mom_30m", "trend_ph"), r))
+        for r in c.execute("""SELECT ts, asset, decision, reason,
+            price_data_ok, volume_data_ok, rsi, mom_30m, trend_ph
+            FROM chart_filter_log ORDER BY id DESC LIMIT 25""").fetchall()
+    ]
+    chart_filter_summary["recent"] = recent_chart
+
     os.makedirs("docs", exist_ok=True)
-    json.dump(dict(updated=now_iso(), models=models, traders=traders, decisions=decisions, meta=meta),
+    json.dump(dict(updated=now_iso(), models=models, traders=traders, decisions=decisions,
+                   meta=meta, filters=filters, chart_filter=chart_filter_summary),
               open("docs/data.json", "w"))
     print("export: traders=%d, model totals:" % len(traders),
           {mn: models[mn]["value"] for _, mn in MODELS})
@@ -798,6 +1389,25 @@ def _model_block(label, rows, note):
     print(f"     open (mark-to-market): ${unreal:+.2f}")
 
 
+def _print_filter_summary(fs):
+    print("\n  -- ENTRY / EXECUTION SIMULATION (paper only) --")
+    print(f"     max entry price: {MAX_ENTRY_PRICE}    min entry price: {MIN_ENTRY_PRICE}")
+    print(f"     copy delay: {COPY_DELAY_SECONDS}s (simulated, not a real sleep)    "
+          f"slippage: {SLIPPAGE_BPS} bps    paper fee: {PAPER_FEE_BPS} bps")
+    print(f"     book gates: MAX_SLIPPAGE={MAX_SLIPPAGE}  MIN_LIQUIDITY={MIN_LIQUIDITY}  "
+          f"MAX_DETECTION_LAG_SECONDS={MAX_DETECTION_LAG_SECONDS}")
+    rate = "n/a" if fs["acceptance_rate"] is None else f"{fs['acceptance_rate'] * 100:.1f}%"
+    print("  FILTER_SUMMARY")
+    print(f"     candidates={fs['total']}  accepted={fs['accepted']}  "
+          f"rejected={fs['skipped']}  acceptance_rate={rate}")
+    print(f"     detection lag: median {fs['median_detection_lag_sec']}s / "
+          f"avg {fs['avg_detection_lag_sec']}s")
+    print(f"     avg simulated slippage: {fs['avg_slippage_amount']}    "
+          f"total simulated fees: ${fs['total_paper_fees']}")
+    for reason in SKIP_REASONS:
+        print(f"     {reason}={fs['reasons'][reason]}")
+
+
 def report():
     c = db()
     rows = c.execute("SELECT COALESCE(model,'hold'),status,stake,pnl FROM copies").fetchall()
@@ -805,7 +1415,11 @@ def report():
     print("  POLYMARKET COPYBOT — two parallel models ($10/copy)")
     print("=" * 64)
     if not rows:
-        print("  no copies yet — run tick.\n"); return
+        print("  no copies yet — run tick.\n")
+        fs = _filter_summary(c)
+        if fs["total"]:   # trades were evaluated even though none were copied (e.g. all rejected)
+            _print_filter_summary(fs)
+        return
     hold = [(r[1], r[2], r[3]) for r in rows if r[0] == "hold"]
     exit_ = [(r[1], r[2], r[3]) for r in rows if r[0] == "exit"]
     cdec = [(r[1], r[2], r[3]) for r in rows if r[0] == "cdecide"]
@@ -825,6 +1439,8 @@ def report():
     if lags:
         lags.sort()
         print(f"\n  detection lag: median {lags[len(lags)//2]/60:.1f} min over {len(lags)} trades")
+
+    _print_filter_summary(_filter_summary(c))
     print("=" * 64 + "\n")
 
 

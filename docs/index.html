@@ -54,8 +54,11 @@
   <div class="sec">trader leaderboard — who's worth copying (each trader has their own $20 per model)</div>
   <div id="lb"></div>
   <div class="sec" style="margin-top:28px;font-size:11px;color:#666">
-    A=hold (to resolution) · B=sell +15% or 36h cap · C=claude+charts (HOLD/SELL w/ RSI+trend context) · D=30% SL + 25% trail arm / 20% drop · E=D exits + chart-filtered entry (RSI&gt;78 or &gt;18% chase in 30m → skip)
+    A=hold (to resolution) · B=sell +15% or 36h cap · C=claude+charts (HOLD/SELL w/ RSI+trend context) · D=30% SL + 25% trail arm / 20% drop · E=D exits + chart-filtered entry (RSI&gt;78 or &gt;$0.10 chase in 30m → skip)
   </div>
+
+  <div class="sec" style="margin-top:24px">model E chart gate — entry audit log (fail-closed: price required, volume optional)</div>
+  <div id="chart_gate"></div>
 
   <div class="sec">claude's decisions — every move &amp; why (model c)</div>
   <div class="feed" id="feed"></div>
@@ -85,7 +88,11 @@ async function load(){
   const h = document.getElementById('health');
   const openRisk = meta.open_risk != null ? money(meta.open_risk) : '—';
   const claude = meta.claude_calls_24h != null ? meta.claude_calls_24h : '—';
-  h.innerHTML = `health: open risk <b>${openRisk}</b> · claude calls (24h) <b>${claude}</b> · ${meta.note || 'E filters active (RSI &amp; chase)'}`;
+  const cf = d.chart_filter || {};
+  const cfLine = cf.total_evaluations != null
+    ? ` · E chart gate: <b>${cf.total_evaluations}</b> eval · <b class="pos">${cf.accepted??0}</b> ok · <b class="neg">${cf.rejected??0}</b> blocked (${cf.rejected_no_price_data??0} no-price-data)`
+    : '';
+  h.innerHTML = `health: open risk <b>${openRisk}</b> · claude calls (24h) <b>${claude}</b> · ${meta.note || 'E filters active (RSI &amp; chase)'}${cfLine}`;
 
   document.getElementById('board').innerHTML = MK.filter(k=>d.models[k]).map(k=>{ const m=d.models[k]; const dv=m.value-m.started;
     const wr = m.closed ? Math.round((m.realized > 0 ? 70 : 50) /* placeholder; real wr lives in trader rows */) : 0;
@@ -112,6 +119,47 @@ async function load(){
         <span class="badge ${x.decision}">${x.decision}</span></div>
       <div class="why">“${x.why||''}”</div></div>`).join('')
     || '<div class="card">no decisions yet — claude acts once positions move ±5–10%</div>';
+
+  // Model E chart-gate audit panel
+  const cgEl = document.getElementById('chart_gate');
+  if (cgEl) {
+    if (cf && cf.total_evaluations != null) {
+      const stratRejected = (cf.rejected||0) - (cf.rejected_no_price_data||0);
+      const recentRows = (cf.recent||[]).slice(0,10).map(r => {
+        const ok = r.decision === 1;
+        const hasVol = r.volume_data_ok === 1;
+        const cls = ok ? 'pos' : 'neg';
+        return `<tr>
+          <td>${(r.asset||'').slice(0,12)}</td>
+          <td><b class="${cls}">${ok?'✓ ok':'✗ skip'}</b></td>
+          <td style="color:var(--dim)">${r.reason||'—'}</td>
+          <td>${r.rsi!=null?(+r.rsi).toFixed(1):'—'}</td>
+          <td>${r.mom_30m!=null?((+r.mom_30m)>=0?'+':'')+(+r.mom_30m).toFixed(3):'—'}</td>
+          <td>${hasVol?'yes':'<span style="opacity:.5">no</span>'}</td>
+        </tr>`;
+      }).join('');
+      cgEl.innerHTML = `<div class="card">
+        <div class="meta">
+          Evaluations: <b>${cf.total_evaluations}</b> ·
+          Accepted: <b class="pos">${cf.accepted??0}</b> ·
+          Rejected: <b class="neg">${cf.rejected??0}</b>
+          <span style="font-size:11px;color:var(--dim)">
+            (${cf.rejected_no_price_data??0} missing price history ·
+             ${stratRejected} blocked by chart strategy rule)
+          </span> ·
+          With volume data: <b>${cf.evaluations_with_volume??0}</b> ·
+          Policy: <b>${cf.fail_closed_policy||'—'}</b>
+        </div>
+        ${recentRows ? `<div class="meta" style="margin-top:8px;color:#666">recent decisions (newest first):</div>
+          <table style="margin-top:4px">
+            <tr><th>asset</th><th>decision</th><th>reason</th><th>RSI</th><th>mom_30m</th><th>vol</th></tr>
+            ${recentRows}
+          </table>` : ''}
+      </div>`;
+    } else {
+      cgEl.innerHTML = '<div class="card" style="font-size:11px;color:#666">no chart gate data yet — run copybot export after the next tick.</div>';
+    }
+  }
 
   // v2 SDD Trader Edge Breakdown (quality matrix) - loaded separately for the upgrade
   try {
