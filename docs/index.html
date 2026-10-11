@@ -5,183 +5,608 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>copytrader — trader & model scoreboard</title>
 <link rel="preconnect" href="https://api.fontshare.com">
-<link href="https://api.fontshare.com/v2/css?f[]=manrope@300,400,500&display=swap" rel="stylesheet">
+<link href="https://api.fontshare.com/v2/css?f[]=manrope@300,400,500,600&display=swap" rel="stylesheet">
 <style>
-  :root{ --bg:#262626; --panel:#2e2e2e; --line:#3a3a3a; --txt:#e8e8e8; --dim:#9a9a9a;
-         --green:#7fcf9f; --red:#e08f8f; --hold:#8fb8e0 }
-  *{ box-sizing:border-box; margin:0; padding:0 }
-  body{ background:var(--bg); color:var(--txt); font-family:'Manrope',system-ui,sans-serif;
-        font-weight:300; line-height:1.5; padding:30px 18px 80px; max-width:1080px; margin:0 auto;
-        -webkit-font-smoothing:antialiased }
-  h1{ font-weight:300; font-size:21px; letter-spacing:.3px }
-  .sub{ color:var(--dim); font-size:12.5px; margin-top:4px }
-  .dot{ display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--green);
-        margin-right:7px; animation:p 2s infinite } @keyframes p{ 50%{ opacity:.3 } }
-  .board{ display:flex; gap:12px; flex-wrap:wrap; margin:24px 0 }
-  .m{ flex:1; min-width:200px; background:var(--panel); border:1px solid var(--line);
-      border-radius:16px; padding:16px 18px }
-  .m h3{ font-weight:400; font-size:13px; color:var(--dim) } .m h3 b{ color:var(--txt); font-weight:500 }
-  .m .pnl{ font-size:27px; font-weight:400; margin:8px 0 2px } .m .pl{ font-size:11.5px; color:var(--dim) }
-  .sec{ font-size:12.5px; color:var(--dim); letter-spacing:.5px; margin:32px 0 12px;
-        border-bottom:1px solid var(--line); padding-bottom:8px }
-  table{ width:100%; border-collapse:collapse; font-size:13px }
-  th{ text-align:left; color:var(--dim); font-weight:400; font-size:11px; padding:9px 10px; border-bottom:1px solid var(--line) }
-  td{ padding:10px; border-bottom:1px solid var(--line) } tr:last-child td{ border-bottom:none }
-  th.r,td.r{ text-align:right }
-  .rank{ color:var(--dim); width:26px } .nm{ font-weight:400 }
-  .cell b{ font-weight:400 } .cell span{ display:block; font-size:10.5px; color:var(--dim) }
-  .pos{ color:var(--green) } .neg{ color:var(--red) } .flat{ color:var(--dim) }
-  .win{ outline:1px solid rgba(127,207,159,.4); border-radius:6px }
-  .feed{ display:flex; flex-direction:column; gap:8px }
-  .card{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 15px }
-  .card .top{ display:flex; justify-content:space-between; gap:10px } .mkt{ font-size:13.5px; flex:1 }
-  .when{ color:var(--dim); font-size:11px; white-space:nowrap }
-  .why{ color:var(--dim); font-size:12.5px; margin-top:6px; font-style:italic }
-  .meta{ font-size:12px; color:var(--dim); margin-top:5px }
-  .badge{ font-size:10.5px; padding:2px 9px; border-radius:20px; margin-left:6px }
-  .SELL{ background:rgba(224,143,143,.15); color:var(--red) } .HOLD{ background:rgba(143,184,224,.15); color:var(--hold) }
+  :root {
+    --bg: #222222;
+    --panel: #2b2b2b;
+    --panel-sub: #252525;
+    --line: #383838;
+    --txt: #e8e8e8;
+    --dim: #9a9a9a;
+    --green: #7fcf9f;
+    --red: #e08f8f;
+    --hold: #8fb8e0;
+    --accent: #d4a373;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--txt);
+    font-family: 'Manrope', system-ui, -apple-system, sans-serif;
+    font-weight: 300;
+    line-height: 1.5;
+    padding: 28px 16px 80px;
+    max-width: 1100px;
+    margin: 0 auto;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Header */
+  header { margin-bottom: 24px; }
+  .title-row { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  h1 { font-weight: 400; font-size: 21px; letter-spacing: .3px; display: flex; align-items: center; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green); margin-right: 9px; animation: p 2s infinite; }
+  @keyframes p { 50% { opacity: .3; } }
+  .tag { font-size: 11px; color: var(--dim); border: 1px solid var(--line); padding: 2px 8px; border-radius: 12px; }
+  .sub { color: var(--dim); font-size: 12px; margin-top: 5px; }
+
+  /* Sections */
+  .sec-header {
+    margin: 36px 0 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .sec-title {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .6px;
+    text-transform: uppercase;
+    color: var(--txt);
+  }
+  .sec-desc { font-size: 11.5px; color: var(--dim); }
+
+  /* Cards & Grid */
+  .grid-stat { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .card h3 { font-size: 11.5px; font-weight: 500; color: var(--dim); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 6px; }
+  .card .big { font-size: 24px; font-weight: 400; line-height: 1.2; }
+  .card .caption { font-size: 11px; color: var(--dim); margin-top: 6px; line-height: 1.4; }
+
+  /* Tables */
+  .table-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; text-align: left; }
+  th {
+    padding: 10px 12px;
+    font-weight: 500;
+    font-size: 11px;
+    color: var(--dim);
+    border-bottom: 1px solid var(--line);
+    letter-spacing: .3px;
+    white-space: nowrap;
+  }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  tr:last-child td { border-bottom: none; }
+  .r { text-align: right; }
+  .c { text-align: center; }
+  .nm { font-weight: 500; color: var(--txt); }
+  .rank { color: var(--dim); width: 26px; }
+
+  /* Value styling */
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .flat { color: var(--dim); }
+  .win { outline: 1px solid rgba(127,207,159,.35); border-radius: 6px; }
+  .cell b { font-weight: 500; }
+  .cell span { display: block; font-size: 10px; color: var(--dim); margin-top: 1px; }
+
+  /* Badges & Notes */
+  .badge { font-size: 10.5px; padding: 2px 8px; border-radius: 14px; font-weight: 500; display: inline-block; }
+  .badge-ok { background: rgba(127,207,159,.15); color: var(--green); }
+  .badge-skip { background: rgba(224,143,143,.15); color: var(--red); }
+  .SELL { background: rgba(224,143,143,.15); color: var(--red); }
+  .HOLD { background: rgba(143,184,224,.15); color: var(--hold); }
+  .info-box {
+    background: var(--panel-sub);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 11px;
+    color: var(--dim);
+    margin-top: 10px;
+    line-height: 1.45;
+  }
+
+  /* Feeds */
+  .feed-grid { display: flex; flex-direction: column; gap: 8px; }
+  .decision-item {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 11px 14px;
+  }
+  .dec-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .dec-title { font-size: 13px; font-weight: 400; flex: 1; }
+  .dec-time { font-size: 11px; color: var(--dim); white-space: nowrap; }
+  .dec-meta { font-size: 11.5px; color: var(--dim); margin-top: 5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .dec-why { font-size: 12px; color: var(--dim); margin-top: 5px; font-style: italic; }
+
+  /* Heatmap for quality */
+  .qcell { text-align: center; font-size: 11px; padding: 8px 6px; }
+  .qcell.good { background: rgba(127,207,159,.12); color: var(--green); font-weight: 500; }
+  .qcell.bad { background: rgba(224,143,143,.10); color: var(--red); }
+  .qcell.empty { color: var(--dim); font-size: 10.5px; opacity: .7; }
+
+  @media (max-width: 768px) {
+    body { padding: 18px 10px 60px; }
+    .grid-stat { grid-template-columns: 1fr; }
+    .card .big { font-size: 21px; }
+  }
 </style>
 </head>
 <body>
-  <h1><span class="dot"></span>polymarket copytrader</h1>
-  <div class="sub" id="sub">loading…</div>
 
-  <div id="health" style="margin:12px 0 20px;font-size:12px;color:#9a9a9a;line-height:1.4"></div>
+  <!-- HEADER -->
+  <header>
+    <div class="title-row">
+      <h1><span class="dot"></span>polymarket copytrader</h1>
+      <span class="tag">paper simulation · forward-only</span>
+    </div>
+    <div class="sub" id="sub">loading…</div>
+  </header>
 
-  <div class="sec">model totals — which exit strategy wins (each = 20 traders × $20)</div>
-  <div class="board" id="board"></div>
+  <!-- SECTION A: OVERVIEW -->
+  <section id="sec-overview">
+    <div class="sec-header">
+      <span class="sec-title">Section A · Portfolio Overview</span>
+      <span class="sec-desc">Aggregated balance and risk across all 5 copy models</span>
+    </div>
+    <div class="grid-stat" id="overview-grid">
+      <div class="card">
+        <h3>Starting Allocation</h3>
+        <div class="big" id="stat-started">$2,000.00</div>
+        <div class="caption">5 models × 20 traders × $20 virtual bankroll</div>
+      </div>
+      <div class="card">
+        <h3>Current Displayed Equity</h3>
+        <div class="big" id="stat-equity">—</div>
+        <div class="caption" id="stat-equity-sub">Cash balance + active position valuation</div>
+      </div>
+      <div class="card">
+        <h3>Net Change from Start</h3>
+        <div class="big" id="stat-netchange">—</div>
+        <div class="caption">Displayed equity minus starting allocation</div>
+      </div>
+      <div class="card">
+        <h3>Total Realized P&L</h3>
+        <div class="big" id="stat-realized">—</div>
+        <div class="caption">Cumulative locked profit/loss on closed trades</div>
+      </div>
+      <div class="card">
+        <h3>Total Unrealized P&L</h3>
+        <div class="big" id="stat-unrealized">—</div>
+        <div class="caption" id="stat-unrealized-sub">Aggregate mark-to-market P&L on open positions</div>
+      </div>
+      <div class="card">
+        <h3>Open Position Risk</h3>
+        <div class="big" id="stat-risk">—</div>
+        <div class="caption" id="stat-risk-sub">Current capital deployed in open forward copies</div>
+      </div>
+    </div>
+    <div class="info-box" id="health-note">
+      health status: loading…
+    </div>
+  </section>
 
-  <div class="sec">trader leaderboard — who's worth copying (each trader has their own $20 per model)</div>
-  <div id="lb"></div>
-  <div class="sec" style="margin-top:28px;font-size:11px;color:#666">
-    A=hold (to resolution) · B=sell +15% or 36h cap · C=claude+charts (HOLD/SELL w/ RSI+trend context) · D=30% SL + 25% trail arm / 20% drop · E=D exits + chart-filtered entry (RSI&gt;78 or &gt;$0.10 chase in 30m → skip)
-  </div>
+  <!-- SECTION B: MODEL COMPARISON -->
+  <section id="sec-models">
+    <div class="sec-header">
+      <span class="sec-title">Section B · Model Strategy Comparison</span>
+      <span class="sec-desc">Evaluating 5 parallel exit strategies on identical trader entries ($2/copy)</span>
+    </div>
+    <div class="table-wrap">
+      <table id="model-table">
+        <thead>
+          <tr>
+            <th>Model & Strategy</th>
+            <th class="r">Starting</th>
+            <th class="r">Current Balance</th>
+            <th class="r">Net Change</th>
+            <th class="r">Realized P&L</th>
+            <th class="r">Unrealized P&L</th>
+            <th class="r">Open Copies</th>
+            <th class="r">Closed Copies</th>
+            <th class="r">Status</th>
+          </tr>
+        </thead>
+        <tbody id="model-rows">
+          <!-- Populated by JS -->
+        </tbody>
+      </table>
+    </div>
+    <div class="info-box">
+      <b>Accounting &amp; P&L Definitions:</b>
+      <br>• <b>Starting Allocation:</b> Initial paper bankroll ($400 per model = 20 traders × $20).
+      <br>• <b>Current Balance (Equity):</b> Current available cash + mark-to-market value of open positions (recycled capital).
+      <br>• <b>Realized P&L:</b> Cumulative profit/loss locked in upon position exits (sales or market resolutions).
+      <br>• <b>Unrealized P&L:</b> Mark-to-market gain/loss on currently active open positions (<code>open_value − open_stake</code>). If mark prices have not yet fluctuated or are not in the export snapshot, reported as <code>$0.00</code> or <code>N/A</code>.
+      <br>• <b>Why Realized P&L can differ from Balance Change:</b> When Model B or D exits a trade at profit, proceeds are returned to that trader's cash pool and immediately recycled into subsequent $2 copy trades. The cumulative Realized P&L sums all historical gains, while Current Balance reflects active equity after subsequent position deployments and marks.
+    </div>
+  </section>
 
-  <div class="sec" style="margin-top:24px">model E chart gate — entry audit log (fail-closed: price required, volume optional)</div>
-  <div id="chart_gate"></div>
+  <!-- SECTION C: TRADER LEADERBOARD -->
+  <section id="sec-traders">
+    <div class="sec-header">
+      <span class="sec-title">Section C · Trader Leaderboard</span>
+      <span class="sec-desc">Tracked on-chain wallets ranked by best current model performance</span>
+    </div>
+    <div class="table-wrap">
+      <table id="trader-table">
+        <thead>
+          <tr>
+            <th class="rank">#</th>
+            <th>Trader Wallet</th>
+            <th class="r">A · Hold</th>
+            <th class="r">B · +15%</th>
+            <th class="r">C · Claude</th>
+            <th class="r">D · Trail</th>
+            <th class="r">E · Chart</th>
+            <th class="r">Best Value</th>
+          </tr>
+        </thead>
+        <tbody id="trader-rows">
+          <!-- Populated by JS -->
+        </tbody>
+      </table>
+    </div>
+    <div class="info-box">
+      <b>Legend:</b> Each trader has an independent $20 virtual allocation per model. Cells show current displayed value (bold) and closed trade count + win rate (subtext).
+      <b>Best Value</b> reflects the trader's highest current model balance in this snapshot. Green highlights denote values above starting $20.00.
+    </div>
+  </section>
 
-  <div class="sec">claude's decisions — every move &amp; why (model c)</div>
-  <div class="feed" id="feed"></div>
+  <!-- SECTION D: MODEL E CHART AUDIT -->
+  <section id="sec-chart-audit">
+    <div class="sec-header">
+      <span class="sec-title">Section D · Model E Chart Entry Audit</span>
+      <span class="sec-desc">Pre-entry filter verification (Fail-Closed: price required, volume optional)</span>
+    </div>
+    <div class="card" id="chart-audit-card">
+      <div id="chart-audit-stats">loading chart gate data…</div>
+      <div class="table-wrap" style="margin-top:12px; display:none;" id="chart-decisions-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Asset / Token</th>
+              <th>Gate Decision</th>
+              <th>Reason Code</th>
+              <th>1h RSI</th>
+              <th>30m Momentum</th>
+              <th>Volume Data</th>
+            </tr>
+          </thead>
+          <tbody id="chart-decisions-rows"></tbody>
+        </table>
+      </div>
+      <div class="info-box">
+        <b>Policy &amp; Gating:</b> Model E rejects entries if 1h price history has &lt;20 bars, API errors occur, RSI &gt; 78, 30m absolute price increase &gt; $0.10, or steep downtrends appear.
+        Volume data is optional (drying volume &lt; 0.3x ratio with selling pressure rejects if present, but missing volume does not block entry).
+        <i>Passing the chart filter does not guarantee execution</i>, as global orderbook liquidity and slippage gates still apply before orders are recorded.
+      </div>
+    </div>
+  </section>
 
-  <div class="sec" style="margin-top:24px">trader edge breakdown (v2 category + quality scoring) — only copy specialists in lanes they actually win</div>
-  <div id="quality"></div>
-  <div class="note" style="font-size:11px;color:#666;margin-top:4px">Data from docs/quality.json (auto-updated on export). Green = trusted in that category (min trades + WR/ROI gate). This is the highest-leverage filter from the v2 SDD.</div>
+  <!-- SECTION E: CLAUDE DECISIONS -->
+  <section id="sec-claude">
+    <div class="sec-header">
+      <span class="sec-title">Section E · Claude Decision Feed (Model C)</span>
+      <span class="sec-desc">AI-assisted HOLD / SELL evaluations when positions move ±5–10%</span>
+    </div>
+    <div class="feed-grid" id="claude-feed">
+      <!-- Populated by JS -->
+    </div>
+  </section>
+
+  <!-- SECTION F: CATEGORY ANALYSIS -->
+  <section id="sec-quality">
+    <div class="sec-header">
+      <span class="sec-title">Section F · Trader Edge Breakdown (Category Specialization)</span>
+      <span class="sec-desc">Historical lane edge: specialists are only copied in categories with proven edge</span>
+    </div>
+    <div class="table-wrap">
+      <div id="quality-table-container">loading category matrix…</div>
+    </div>
+    <div class="info-box">
+      <b>Category Edge Rule:</b> Data from <code>docs/quality.json</code>. Green cells denote trusted performance in that sector. Categories with no activity show explicit notice rather than ambiguous figures.
+    </div>
+  </section>
 
 <script>
-const money = v => '$'+(v??0).toFixed(2);
-const cell = v => { const c = v>20.05?'pos':v<19.95?'neg':'flat';
-  return `<td class="r cell"><b class="${c}">${money(v)}</b></td>`; };
-const ago = ts => { const s=(Date.now()-new Date(ts).getTime())/1000;
-  if(s<90)return Math.round(s)+'s ago'; if(s<5400)return Math.round(s/60)+'m ago';
-  if(s<129600)return Math.round(s/3600)+'h ago'; return Math.round(s/86400)+'d ago'; };
-const NAMES={A:'A · hold',B:'B · sell +15%',C:'C · claude+charts',D:'D · cut losers, ride winners',E:'E · chart-filtered entry'};
-const MK=['A','B','C','D','E'];
+const money = v => '$' + (v ?? 0).toFixed(2);
+const cell = v => {
+  const c = v > 20.05 ? 'pos' : v < 19.95 ? 'neg' : 'flat';
+  return `<td class="r cell"><b class="${c}">${money(v)}</b></td>`;
+};
+const ago = ts => {
+  if (!ts) return '—';
+  const s = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (s < 90) return Math.round(s) + 's ago';
+  if (s < 5400) return Math.round(s / 60) + 'm ago';
+  if (s < 129600) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+};
 
-async function load(){
-  let d; try{ d=await (await fetch('./data.json?'+Date.now())).json(); }
-  catch(e){ document.getElementById('sub').textContent='no data yet — bot warming up'; return; }
+const MODEL_INFO = {
+  A: { name: 'A · Hold', rule: 'Hold to market resolution' },
+  B: { name: 'B · Exit +15%', rule: 'Take profit at +15% or 36h cap' },
+  C: { name: 'C · Claude', rule: 'Claude HOLD/SELL with chart context' },
+  D: { name: 'D · Trail', rule: '30% stop loss + 25% arm / 20% trailing drop' },
+  E: { name: 'E · Chart Gate', rule: 'Model D exits + pre-entry 1h chart filter' }
+};
+const MK = ['A', 'B', 'C', 'D', 'E'];
+
+async function load() {
+  let d;
+  try {
+    d = await (await fetch('./data.json?' + Date.now())).json();
+  } catch (e) {
+    document.getElementById('sub').textContent = 'no data yet — bot warming up';
+    return;
+  }
+
   const meta = d.meta || {};
-  document.getElementById('sub').textContent =
-    `updated ${ago(d.updated)} · auto-refresh 60s · $2/copy · median lag ${meta.lag_p50_min ?? '?'}m · ${meta.wallets ?? '?'} wallets`;
-
-  // health strip
-  const h = document.getElementById('health');
-  const openRisk = meta.open_risk != null ? money(meta.open_risk) : '—';
-  const claude = meta.claude_calls_24h != null ? meta.claude_calls_24h : '—';
+  const models = d.models || {};
+  const traders = d.traders || [];
   const cf = d.chart_filter || {};
-  const cfLine = cf.total_evaluations != null
-    ? ` · E chart gate: <b>${cf.total_evaluations}</b> eval · <b class="pos">${cf.accepted??0}</b> ok · <b class="neg">${cf.rejected??0}</b> blocked (${cf.rejected_no_price_data??0} no-price-data)`
+
+  // Header Sub
+  document.getElementById('sub').textContent =
+    `Updated ${ago(d.updated)} · Auto-refresh 60s · $2/copy · Median feed lag ${meta.lag_p50_min ?? '?'}m · ${meta.wallets ?? '?'} Tracked Wallets`;
+
+  // --- SECTION A: OVERVIEW ---
+  let totalStarted = 0, totalEquity = 0, totalRealized = 0, totalUnrealized = 0;
+  let hasAnyUnrealized = false;
+  MK.forEach(k => {
+    if (models[k]) {
+      totalStarted += (models[k].started || 0);
+      totalEquity += (models[k].value || 0);
+      totalRealized += (models[k].realized || 0);
+      if (models[k].unrealized != null) {
+        totalUnrealized += models[k].unrealized;
+        hasAnyUnrealized = true;
+      }
+    }
+  });
+
+  document.getElementById('stat-started').textContent = money(totalStarted);
+
+  const eqEl = document.getElementById('stat-equity');
+  eqEl.textContent = money(totalEquity);
+  const eqDiff = totalEquity - totalStarted;
+  eqEl.className = 'big ' + (eqDiff >= 0 ? 'pos' : 'neg');
+  document.getElementById('stat-equity-sub').textContent =
+    `Current pool: ${money(totalEquity)} across 5 models`;
+
+  const netEl = document.getElementById('stat-netchange');
+  netEl.textContent = (eqDiff >= 0 ? '+' : '−') + money(Math.abs(eqDiff));
+  netEl.className = 'big ' + (eqDiff >= 0 ? 'pos' : 'neg');
+
+  const realEl = document.getElementById('stat-realized');
+  realEl.textContent = money(totalRealized);
+  realEl.className = 'big ' + (totalRealized >= 0 ? 'pos' : 'neg');
+
+  const unEl = document.getElementById('stat-unrealized');
+  const unSub = document.getElementById('stat-unrealized-sub');
+  const totalUnrealNum = (meta.total_unrealized != null) ? meta.total_unrealized : (hasAnyUnrealized ? totalUnrealized : null);
+  if (totalUnrealNum != null) {
+    unEl.textContent = (totalUnrealNum >= 0 ? '+' : '−') + money(Math.abs(totalUnrealNum));
+    unEl.className = 'big ' + (totalUnrealNum >= 0 ? 'pos' : 'neg');
+    unSub.textContent = 'Aggregate mark-to-market P&L on active open positions';
+  } else {
+    unEl.textContent = 'N/A';
+    unEl.className = 'big flat';
+    unSub.textContent = 'Not broken out separately in this exported payload';
+  }
+
+  document.getElementById('stat-risk').textContent = meta.open_risk != null ? money(meta.open_risk) : 'N/A';
+
+  const cfBrief = cf.total_evaluations != null
+    ? ` · Model E Gate: <b>${cf.total_evaluations}</b> evaluations (<span class="pos">${cf.accepted ?? 0} ok</span>, <span class="neg">${cf.rejected ?? 0} blocked</span>)`
     : '';
-  h.innerHTML = `health: open risk <b>${openRisk}</b> · claude calls (24h) <b>${claude}</b> · ${meta.note || 'E filters active (RSI &amp; chase)'}${cfLine}`;
+  document.getElementById('health-note').innerHTML =
+    `<b>System Health:</b> Claude calls (24h): <b>${meta.claude_calls_24h ?? '—'}</b> · Detection lag p50: <b>${meta.lag_p50_min ?? '?'}m</b> · Note: <i>${meta.note || 'E filters active'}</i>${cfBrief}`;
 
-  document.getElementById('board').innerHTML = MK.filter(k=>d.models[k]).map(k=>{ const m=d.models[k]; const dv=m.value-m.started;
-    const wr = m.closed ? Math.round((m.realized > 0 ? 70 : 50) /* placeholder; real wr lives in trader rows */) : 0;
-    return `<div class="m"><h3>${NAMES[k]}</h3>
-      <div class="pnl ${dv>=0?'pos':'neg'}">${money(m.value)}</div>
-      <div class="pl">started ${money(m.started)} (${dv>=0?'+':'−'}${money(Math.abs(dv))}) · ${m.closed} closed · ${m.open} open${m.realized?` · realized ${money(m.realized)}`:''}</div>
-      </div>`; }).join('');
+  // --- SECTION B: MODEL COMPARISON TABLE ---
+  document.getElementById('model-rows').innerHTML = MK.map(k => {
+    const m = models[k];
+    if (!m) return '';
+    const info = MODEL_INFO[k] || { name: k, rule: '' };
+    const diff = (m.value || 0) - (m.started || 0);
+    const diffClass = diff >= 0 ? 'pos' : 'neg';
+    const realClass = (m.realized || 0) >= 0 ? 'pos' : 'neg';
 
-  const T=d.traders||[];
-  document.getElementById('lb').innerHTML = `<table>
-    <tr><th class="rank"></th><th>trader</th>
-        <th class="r">A·hold</th><th class="r">B·+15%</th><th class="r">C·claude</th><th class="r">D·trail</th><th class="r">E·chart</th><th class="r">best</th></tr>
-    ${T.map((t,i)=>{ const vals=MK.map(m=>t[m]?t[m].value:20); const best=Math.max(...vals);
-      const c=(m)=>{ const v=t[m]?t[m].value:20; const wr=t[m]&&t[m].closed?`<span>${t[m].closed} cl · ${t[m].win_rate||0}%</span>`:`<span>${t[m]?t[m].closed:0} cl</span>`; return `<td class="r cell ${v===best&&v>20.05?'win':''}"><b class="${v>20.05?'pos':v<19.95?'neg':'flat'}">${money(v)}</b>${wr}</td>`; };
-      return `<tr><td class="rank">${i+1}</td><td class="nm">${t.name}</td>
-        ${c('A')}${c('B')}${c('C')}${c('D')}${c('E')}
-        <td class="r"><b class="${best>20.05?'pos':best<19.95?'neg':'flat'}">${money(best)}</b></td></tr>`; }).join('')}
-  </table>`;
+    let unrealCell = '<td class="r flat">N/A</td>';
+    if (m.unrealized != null) {
+      const uClass = m.unrealized >= 0 ? 'pos' : 'neg';
+      unrealCell = `<td class="r ${uClass}">${m.unrealized >= 0 ? '+' : '−'}${money(Math.abs(m.unrealized))}</td>`;
+    }
 
-  document.getElementById('feed').innerHTML = (d.decisions||[]).slice(0,30).map(x=>`
-    <div class="card"><div class="top"><div class="mkt">${x.title}</div><span class="when">${ago(x.ts)}</span></div>
-      <div class="meta">${x.wallet} · ${x.entry?.toFixed(2)}→${x.current?.toFixed(2)}
-        <span class="${x.gain>=0?'pos':'neg'}">(${x.gain>=0?'+':''}${x.gain}%)</span>
-        <span class="badge ${x.decision}">${x.decision}</span></div>
-      <div class="why">“${x.why||''}”</div></div>`).join('')
-    || '<div class="card">no decisions yet — claude acts once positions move ±5–10%</div>';
+    const statusNote = m.closed > 0
+      ? `<span class="badge badge-ok">${m.closed} closed</span>`
+      : `<span class="badge" style="background:#333;color:#888;">no exits yet</span>`;
 
-  // Model E chart-gate audit panel
-  const cgEl = document.getElementById('chart_gate');
-  if (cgEl) {
-    if (cf && cf.total_evaluations != null) {
-      const stratRejected = (cf.rejected||0) - (cf.rejected_no_price_data||0);
-      const recentRows = (cf.recent||[]).slice(0,10).map(r => {
+    return `<tr>
+      <td>
+        <b>${info.name}</b>
+        <span style="display:block;font-size:11px;color:var(--dim);">${info.rule}</span>
+      </td>
+      <td class="r">${money(m.started)}</td>
+      <td class="r cell"><b>${money(m.value)}</b></td>
+      <td class="r ${diffClass}">${diff >= 0 ? '+' : '−'}${money(Math.abs(diff))}</td>
+      <td class="r ${realClass}"><b>${money(m.realized)}</b></td>
+      ${unrealCell}
+      <td class="r">${m.open ?? 0}</td>
+      <td class="r">${m.closed ?? 0}</td>
+      <td class="r">${statusNote}</td>
+    </tr>`;
+  }).join('');
+
+  // --- SECTION C: TRADER LEADERBOARD ---
+  document.getElementById('trader-rows').innerHTML = traders.map((t, idx) => {
+    const vals = MK.map(m => t[m] ? t[m].value : 20);
+    const best = Math.max(...vals);
+
+    const renderModelCell = (m) => {
+      const tm = t[m];
+      if (!tm) return `<td class="r cell flat">—</td>`;
+      const v = tm.value;
+      const isWin = (v === best && v > 20.05);
+      const valClass = v > 20.05 ? 'pos' : v < 19.95 ? 'neg' : 'flat';
+      const subInfo = tm.closed > 0 ? `${tm.closed} cl · ${tm.win_rate ?? 0}%` : `${tm.open || 0} op`;
+      return `<td class="r cell ${isWin ? 'win' : ''}">
+        <b class="${valClass}">${money(v)}</b>
+        <span>${subInfo}</span>
+      </td>`;
+    };
+
+    const bestClass = best > 20.05 ? 'pos' : best < 19.95 ? 'neg' : 'flat';
+
+    return `<tr>
+      <td class="rank">${idx + 1}</td>
+      <td class="nm">${t.name}</td>
+      ${renderModelCell('A')}
+      ${renderModelCell('B')}
+      ${renderModelCell('C')}
+      ${renderModelCell('D')}
+      ${renderModelCell('E')}
+      <td class="r cell"><b class="${bestClass}">${money(best)}</b></td>
+    </tr>`;
+  }).join('');
+
+  // --- SECTION D: MODEL E CHART AUDIT ---
+  const auditContainer = document.getElementById('chart-audit-stats');
+  const decisionsWrap = document.getElementById('chart-decisions-wrap');
+  const decisionsRows = document.getElementById('chart-decisions-rows');
+
+  if (cf && cf.total_evaluations != null) {
+    const stratRejected = (cf.rejected || 0) - (cf.rejected_no_price_data || 0);
+    auditContainer.innerHTML = `
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:baseline;margin-bottom:6px;">
+        <div>Evaluations: <b>${cf.total_evaluations}</b></div>
+        <div>Passed: <b class="pos">${cf.accepted ?? 0}</b></div>
+        <div>Rejected: <b class="neg">${cf.rejected ?? 0}</b></div>
+        <div style="font-size:11px;color:var(--dim);">
+          (<b>${cf.rejected_no_price_data ?? 0}</b> missing price history · <b>${stratRejected}</b> strategy rule blocks)
+        </div>
+        <div>With Volume: <b>${cf.evaluations_with_volume ?? 0}</b></div>
+        <div>Policy: <code style="font-size:11px;color:var(--accent);">${cf.fail_closed_policy || 'fail-closed'}</code></div>
+      </div>
+    `;
+
+    const recent = cf.recent || [];
+    if (recent.length > 0) {
+      decisionsWrap.style.display = 'block';
+      decisionsRows.innerHTML = recent.slice(0, 15).map(r => {
         const ok = r.decision === 1;
         const hasVol = r.volume_data_ok === 1;
-        const cls = ok ? 'pos' : 'neg';
         return `<tr>
-          <td>${(r.asset||'').slice(0,12)}</td>
-          <td><b class="${cls}">${ok?'✓ ok':'✗ skip'}</b></td>
-          <td style="color:var(--dim)">${r.reason||'—'}</td>
-          <td>${r.rsi!=null?(+r.rsi).toFixed(1):'—'}</td>
-          <td>${r.mom_30m!=null?((+r.mom_30m)>=0?'+':'')+(+r.mom_30m).toFixed(3):'—'}</td>
-          <td>${hasVol?'yes':'<span style="opacity:.5">no</span>'}</td>
+          <td style="white-space:nowrap;color:var(--dim);">${ago(r.ts)}</td>
+          <td><code>${(r.asset || '').slice(0, 14)}…</code></td>
+          <td><span class="badge ${ok ? 'badge-ok' : 'badge-skip'}">${ok ? '✓ PASS' : '✗ SKIP'}</span></td>
+          <td style="color:var(--dim);">${r.reason || '—'}</td>
+          <td>${r.rsi != null ? (+r.rsi).toFixed(1) : '—'}</td>
+          <td>${r.mom_30m != null ? ((+r.mom_30m) >= 0 ? '+' : '') + (+r.mom_30m).toFixed(3) : '—'}</td>
+          <td>${hasVol ? '<span class="pos">✓ yes</span>' : '<span style="color:var(--dim);">no (skipped)</span>'}</td>
         </tr>`;
       }).join('');
-      cgEl.innerHTML = `<div class="card">
-        <div class="meta">
-          Evaluations: <b>${cf.total_evaluations}</b> ·
-          Accepted: <b class="pos">${cf.accepted??0}</b> ·
-          Rejected: <b class="neg">${cf.rejected??0}</b>
-          <span style="font-size:11px;color:var(--dim)">
-            (${cf.rejected_no_price_data??0} missing price history ·
-             ${stratRejected} blocked by chart strategy rule)
-          </span> ·
-          With volume data: <b>${cf.evaluations_with_volume??0}</b> ·
-          Policy: <b>${cf.fail_closed_policy||'—'}</b>
-        </div>
-        ${recentRows ? `<div class="meta" style="margin-top:8px;color:#666">recent decisions (newest first):</div>
-          <table style="margin-top:4px">
-            <tr><th>asset</th><th>decision</th><th>reason</th><th>RSI</th><th>mom_30m</th><th>vol</th></tr>
-            ${recentRows}
-          </table>` : ''}
-      </div>`;
     } else {
-      cgEl.innerHTML = '<div class="card" style="font-size:11px;color:#666">no chart gate data yet — run copybot export after the next tick.</div>';
+      decisionsWrap.style.display = 'none';
     }
+  } else {
+    auditContainer.innerHTML = `
+      <div style="color:var(--dim);font-size:12px;">
+        No persistent Model E chart filter evaluations recorded in this exported snapshot.
+        Filter runs during forward tick execution; summary will appear after next export.
+      </div>
+    `;
+    decisionsWrap.style.display = 'none';
   }
 
-  // v2 SDD Trader Edge Breakdown (quality matrix) - loaded separately for the upgrade
+  // --- SECTION E: CLAUDE DECISIONS ---
+  const decList = d.decisions || [];
+  const feedEl = document.getElementById('claude-feed');
+  if (decList.length > 0) {
+    feedEl.innerHTML = decList.slice(0, 25).map(x => `
+      <div class="decision-item">
+        <div class="dec-top">
+          <div class="dec-title">${x.title || 'Market Trade'}</div>
+          <span class="dec-time">${ago(x.ts)}</span>
+        </div>
+        <div class="dec-meta">
+          <span>Trader: <b>${x.wallet}</b></span>
+          <span>Entry: ${x.entry != null ? (+x.entry).toFixed(3) : '—'} → Cur: ${x.current != null ? (+x.current).toFixed(3) : '—'}</span>
+          <span class="${x.gain >= 0 ? 'pos' : 'neg'}">(${x.gain >= 0 ? '+' : ''}${x.gain}%)</span>
+          <span class="badge ${x.decision}">${x.decision}</span>
+        </div>
+        <div class="dec-why">“${x.why || ''}”</div>
+      </div>
+    `).join('');
+  } else {
+    feedEl.innerHTML = `
+      <div class="card" style="font-size:12px;color:var(--dim);line-height:1.5;">
+        No qualifying Claude HOLD/SELL decisions recorded in this snapshot.
+        Claude evaluates positions when mark-to-market prices deviate ±5–10% from entry.
+      </div>
+    `;
+  }
+
+  // --- SECTION F: CATEGORY MATRIX ---
   try {
-    const qd = await (await fetch('./quality.json?'+Date.now())).json();
+    const qd = await (await fetch('./quality.json?' + Date.now())).json();
     const qlist = qd.quality || [];
-    let qhtml = `<table class="heat"><tr><th>trader</th><th>sports</th><th>crypto_5m</th><th>politics</th><th>crypto_h</th><th>other</th></tr>`;
-    qlist.forEach(t => {
-      const cell = (cat) => {
-        const qq = t[cat] || {trades:0, wr:0, trusted:false};
-        const cls = qq.trusted ? 'good' : (qq.trades >= 4 ? 'bad' : '');
-        const wr = qq.wr ? (qq.wr*100).toFixed(0)+'%' : '—';
-        return `<td class="qcell ${cls}">${wr}<br><span style="font-size:9.5px;opacity:.65">${qq.trades||0}tr</span></td>`;
-      };
-      qhtml += `<tr><td class="nm">${t.name}</td>${cell('sports')}${cell('crypto_5m')}${cell('politics')}${cell('crypto_h')}${cell('other')}</tr>`;
-    });
-    qhtml += `</table>`;
-    document.getElementById('quality').innerHTML = qhtml;
-  } catch(e) {
-    document.getElementById('quality').innerHTML = '<div style="font-size:11px;color:#666">quality.json not yet — run copybot export (or the v2 one) to generate the edge matrix.</div>';
+    const catCols = ['sports', 'crypto_5m', 'politics', 'crypto_h', 'other'];
+
+    if (qlist.length === 0) {
+      document.getElementById('quality-table-container').innerHTML =
+        '<div style="padding:14px;font-size:12px;color:var(--dim);">No classified trades recorded in quality matrix yet.</div>';
+    } else {
+      let qhtml = `<table><thead><tr>
+        <th>Trader</th>
+        <th class="c">Sports</th>
+        <th class="c">Crypto (5m)</th>
+        <th class="c">Politics</th>
+        <th class="c">Crypto (1h)</th>
+        <th class="c">Other</th>
+      </tr></thead><tbody>`;
+
+      qlist.forEach(t => {
+        const renderCat = (cat) => {
+          const qq = t[cat];
+          if (!qq || !qq.trades || qq.trades === 0) {
+            return `<td class="qcell empty">—<br><span style="font-size:9px;">No classified trades</span></td>`;
+          }
+          const cls = qq.trusted ? 'good' : (qq.trades >= 4 ? 'bad' : '');
+          const wr = qq.wr != null ? (qq.wr * 100).toFixed(0) + '%' : '—';
+          return `<td class="qcell ${cls}"><b>${wr}</b><br><span style="font-size:9.5px;opacity:.75;">${qq.trades} trades</span></td>`;
+        };
+
+        qhtml += `<tr>
+          <td class="nm">${t.name}</td>
+          ${catCols.map(c => renderCat(c)).join('')}
+        </tr>`;
+      });
+      qhtml += `</tbody></table>`;
+      document.getElementById('quality-table-container').innerHTML = qhtml;
+    }
+  } catch (e) {
+    document.getElementById('quality-table-container').innerHTML =
+      '<div style="padding:14px;font-size:12px;color:var(--dim);">quality.json not available yet — generated during export.</div>';
   }
 }
-load(); setInterval(load, 60000);
+
+load();
+setInterval(load, 60000);
 </script>
 </body>
 </html>

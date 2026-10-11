@@ -1253,7 +1253,9 @@ def export():
             d = agg.get((mk, t), {"realized": 0, "unreal": 0, "at_risk": 0, "open": 0, "closed": 0, "wins": 0})
             ch = cash.get((mk, t), BANKROLL_PER_MODEL)
             row[mn] = dict(value=round(ch + d["at_risk"] + d["unreal"], 2),
-                           realized=round(d["realized"], 2), open=d["open"], closed=d["closed"],
+                           realized=round(d["realized"], 2),
+                           unrealized=round(d["unreal"], 2),
+                           open=d["open"], closed=d["closed"],
                            win_rate=round(d["wins"] / d["closed"] * 100) if d["closed"] else 0)
         row["best"] = round(max(row["A"]["value"], row["B"]["value"], row["C"]["value"],
                                 row["D"]["value"], row["E"]["value"]), 2)
@@ -1265,6 +1267,7 @@ def export():
         models[mn] = dict(started=round(BANKROLL_PER_MODEL * len(WALLETS), 2),
                           value=round(sum(r[mn]["value"] for r in traders), 2),
                           realized=round(sum(r[mn]["realized"] for r in traders), 2),
+                          unrealized=round(sum(r[mn]["unrealized"] for r in traders), 2),
                           open=sum(r[mn]["open"] for r in traders),
                           closed=sum(r[mn]["closed"] for r in traders))
     decs = c.execute("SELECT ts,wallet,title,entry,current,gain,decision,why FROM decisions "
@@ -1294,6 +1297,7 @@ def export():
         "lag_p50_min": lag_p50,
         "wallets": len(WALLETS),
         "open_risk": round(total_at_risk, 2),
+        "total_unrealized": round(sum(m["unrealized"] for m in models.values()), 2),
         "claude_calls_24h": recent_claude,
         "note": "E entry filter: RSI>78 or 30m absolute price increase >$0.10"
     }

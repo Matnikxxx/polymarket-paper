@@ -557,6 +557,11 @@ class TickIntegrationTests(unittest.TestCase):
         self.assertEqual(f["max_entry_price"], 0.80)
         self.assertEqual(f["min_entry_price"], 0.05)
         self.assertEqual(f["accepted"], 1)
+        # Verify Phase 8.2 export of unrealized P&L
+        self.assertIn("unrealized", data["models"]["A"])
+        self.assertIn("total_unrealized", data["meta"])
+        self.assertEqual(data["meta"]["total_unrealized"],
+                         round(sum(m["unrealized"] for m in data["models"].values()), 2))
         audit = f["recent_accepted"][0]
         for k in ("wallet_price", "market_price", "entry_price", "slippage_amount",
                   "fee", "stake", "shares", "detection_lag"):
@@ -586,6 +591,72 @@ class PaperOnlySafetyTests(unittest.TestCase):
         for bad in ("private_key", "privatekey", "eth_account", "web3", "sign_order",
                     "signer", "place_order", "post_order", "withdraw", "deposit"):
             self.assertNotIn(bad, src, f"paper-only violation: {bad}")
+
+
+class Phase82FinancialMetricsExportTests(unittest.TestCase):
+    """Phase 8.2: Verify actual unrealized P&L export and accounting reconciliation."""
+
+    def setUp(self):
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self._orig_db = copybot.DB
+        copybot.DB = self._tmp.name
+        copybot.db()
+
+    def tearDown(self):
+        copybot.DB = self._orig_db
+        try:
+            os.unlink(self._tmp.name)
+        except OSError:
+            pass
+
+    def test_export_includes_unrealized_and_reconciles_accounting(self):
+        """Verify:
+        1. Each model exports actual 'unrealized'.
+        2. meta exports 'total_unrealized' matching the sum.
+        3. Accounting identity: value == started + realized + unrealized (within rounding).
+        """
+        c = copybot.db()
+        # Ensure bankroll row exists before crediting/debiting
+        copybot._cash(c, "hold", "fox54498")
+        # Seed an open position with unrealized gain
+        # stake=2.0, mark_price=0.60, entry=0.50 -> pnl = +0.40
+        c.execute("""INSERT INTO copies(key,copied_ts,wallet,condition_id,asset,
+            outcome,outcome_index,their_price,entry,stake,shares,status,model,mark_price,pnl)
+            VALUES('t1:0x1:1','2026-10-11T00:00:00Z','fox54498','c1','0x1',
+            'Yes',0,0.50,0.50,2.0,4.0,'open','hold',0.60,0.40)""")
+        # Lock stake out of bankroll
+        copybot._credit(c, "hold", "fox54498", -2.0)
+        c.commit()
+
+        cwd = os.getcwd()
+        tmpdir = tempfile.mkdtemp()
+        try:
+            os.chdir(tmpdir)
+            copybot.export()
+            data = copybot.json.load(open("docs/data.json"))
+        finally:
+            os.chdir(cwd)
+
+        models = data["models"]
+        # Model A (hold) should have unrealized = 0.40
+        self.assertEqual(models["A"]["unrealized"], 0.40)
+        self.assertEqual(models["A"]["open"], 1)
+        self.assertEqual(models["A"]["closed"], 0)
+        self.assertEqual(models["A"]["realized"], 0.0)
+
+        # Value should reflect cash (400 - 2 = 398) + at_risk (2) + unreal (0.40) = 400.40
+        self.assertEqual(models["A"]["value"], 400.40)
+
+        # Accounting identity: value == started + realized + unrealized
+        for mn, m in models.items():
+            expected = round(m["started"] + m["realized"] + m["unrealized"], 2)
+            self.assertAlmostEqual(m["value"], expected, places=2,
+                                   msg=f"Model {mn} accounting does not reconcile")
+
+        # meta.total_unrealized matches sum of models
+        self.assertEqual(data["meta"]["total_unrealized"],
+                         round(sum(m["unrealized"] for m in models.values()), 2))
 
 
 if __name__ == "__main__":
