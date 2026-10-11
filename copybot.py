@@ -365,6 +365,8 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS trader_cat_stats(
         trader TEXT, category TEXT, trades INTEGER, wins INTEGER, realized REAL,
         last_ts TEXT, PRIMARY KEY(trader, category))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS trader_cat_resolved(
+        source_key TEXT PRIMARY KEY, trader TEXT, category TEXT, won INTEGER, pnl REAL, resolved_ts TEXT)""")
     # Entry-filter audit log: one row per unique source trade considered (keyed like
     # `copies` but WITHOUT the :model suffix, since the new filters are per-trade, not
     # per-model), whether accepted or rejected. Powers FILTER_SUMMARY / dashboard.
@@ -865,17 +867,90 @@ def _get_trader_cat_quality(c, trader, category):
     trusted = (wr >= MIN_CAT_WR or roi >= MIN_CAT_ROI)
     return {"trades": trades, "wr": round(wr, 3), "roi": round(roi, 3), "trusted": trusted}
 
-def _update_trader_cat_stat(c, trader, category, won: bool, pnl: float):
-    row = c.execute("SELECT trades, wins, realized FROM trader_cat_stats WHERE trader=? AND category=?",
-                    (trader, category)).fetchone()
-    if row:
-        trades, wins, realized = row
-        c.execute("""UPDATE trader_cat_stats SET trades=?, wins=?, realized=?, last_ts=?
-                     WHERE trader=? AND category=?""",
-                  (trades+1, wins + (1 if won else 0), realized + (pnl or 0), now_iso(), trader, category))
+def _update_trader_cat_stat(c, trader, category, won: bool, pnl: float, source_key: str = None):
+    """Update trader_cat_stats on actual market resolution.
+
+    If source_key is provided, deduplicates across Models A-E and repeated runs so that
+    each unique underlying trader trade contributes at most one sample to trader_cat_stats.
+
+    Atomicity guarantee: the dedup INSERT into trader_cat_resolved and the corresponding
+    UPDATE/INSERT into trader_cat_stats are wrapped in a SQLite SAVEPOINT.  If the stats
+    update fails for any reason both changes are rolled back together, leaving no orphaned
+    dedup row that would permanently block a future retry.
+
+    Error handling:
+      - sqlite3.IntegrityError on the dedup INSERT  → duplicate, skip gracefully → False
+      - Any other exception (stats update or unexpected)  → ROLLBACK TO savepoint, then
+        re-raise so the caller's try/except can log/suppress it.  The re-raise ensures the
+        outer resolve() loop does not silently commit a half-written pair.
+    """
+    if source_key:
+        # SAVEPOINT nests inside the outer transaction that resolve() commits at the end.
+        # Both the dedup INSERT and the stats UPDATE must commit or roll back together.
+        c.execute("SAVEPOINT sp_cat")
+        try:
+            try:
+                c.execute(
+                    "INSERT INTO trader_cat_resolved"
+                    "(source_key, trader, category, won, pnl, resolved_ts) VALUES(?,?,?,?,?,?)",
+                    (source_key, trader, category, 1 if won else 0, pnl or 0.0, now_iso())
+                )
+            except sqlite3.IntegrityError:
+                # Confirm the error is a duplicate primary key on source_key, not an
+                # unrelated constraint violation (NOT NULL, CHECK, etc.).  If source_key
+                # is not in the table, the IntegrityError came from something else and
+                # must propagate so the caller can roll back and retry.
+                existing = c.execute(
+                    "SELECT 1 FROM trader_cat_resolved WHERE source_key=?",
+                    (source_key,)
+                ).fetchone()
+                if existing:
+                    # Confirmed duplicate — skip stats update, release savepoint.
+                    c.execute("RELEASE sp_cat")
+                    return False
+                # Unrelated integrity violation — re-raise so outer except block handles ROLLBACK/RELEASE
+                raise
+            # Stats update — inside the same savepoint so a failure rolls back the dedup
+            # INSERT as well.
+            row = c.execute(
+                "SELECT trades, wins, realized FROM trader_cat_stats WHERE trader=? AND category=?",
+                (trader, category)).fetchone()
+            if row:
+                trades, wins, realized = row
+                c.execute(
+                    """UPDATE trader_cat_stats SET trades=?, wins=?, realized=?, last_ts=?
+                       WHERE trader=? AND category=?""",
+                    (trades + 1, wins + (1 if won else 0), realized + (pnl or 0),
+                     now_iso(), trader, category))
+            else:
+                c.execute(
+                    "INSERT INTO trader_cat_stats VALUES (?,?,?,?,?,?)",
+                    (trader, category, 1, 1 if won else 0, pnl or 0, now_iso()))
+            c.execute("RELEASE sp_cat")
+            return True
+        except Exception:
+            # Roll back BOTH the dedup INSERT and the failed stats update atomically,
+            # then release the savepoint so the outer transaction continues cleanly.
+            c.execute("ROLLBACK TO sp_cat")
+            c.execute("RELEASE sp_cat")
+            raise  # Re-raise: the outer resolve() try/except will handle/log it
     else:
-        c.execute("INSERT INTO trader_cat_stats VALUES (?,?,?,?,?,?)",
-                  (trader, category, 1, 1 if won else 0, pnl or 0, now_iso()))
+        # Legacy path: no source_key, no dedup, no savepoint needed.
+        row = c.execute(
+            "SELECT trades, wins, realized FROM trader_cat_stats WHERE trader=? AND category=?",
+            (trader, category)).fetchone()
+        if row:
+            trades, wins, realized = row
+            c.execute(
+                """UPDATE trader_cat_stats SET trades=?, wins=?, realized=?, last_ts=?
+                   WHERE trader=? AND category=?""",
+                (trades + 1, wins + (1 if won else 0), realized + (pnl or 0),
+                 now_iso(), trader, category))
+        else:
+            c.execute(
+                "INSERT INTO trader_cat_stats VALUES (?,?,?,?,?,?)",
+                (trader, category, 1, 1 if won else 0, pnl or 0, now_iso()))
+        return True
 
 
 def tick():
@@ -1016,13 +1091,13 @@ def resolve():
     # newest-open prioritized for Model B (exit needs frequent price checks); bounded by
     # row count + wall-clock so a slow gamma API can't blow the job timeout.
     rows = c.execute("SELECT id,condition_id,outcome_index,shares,stake,entry,"
-                     "COALESCE(model,'hold'),copied_ts,wallet,peak,asset,title FROM copies "
+                     "COALESCE(model,'hold'),copied_ts,wallet,peak,asset,title,key FROM copies "
                      "WHERE status='open' ORDER BY id DESC LIMIT 150").fetchall()
     deadline = time.time() + 300
     now = time.time()
     settled = marked = exited = 0
     chart_cache = {}   # asset -> chart_signal, fetched lazily for Model E
-    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet, peak, asset, title in rows:
+    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet, peak, asset, title, copy_key in rows:
         if time.time() > deadline:
             print("resolve: hit 5-min deadline, stopping early (rest next run)")
             break
@@ -1039,16 +1114,31 @@ def resolve():
             win_idx = max(range(len(prices)), key=lambda i: prices[i])
             won = (win_idx == oidx) and prices[win_idx] > 0.5
             payout = shares if won else 0.0
-            c.execute("UPDATE copies SET status=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
-                      ("won" if won else "lost", 1.0 if won else 0.0, payout - stake, now_iso(), cid_id))
-            _credit(c, model, wallet, payout)     # proceeds back to this trader's wallet
-            # SDD v2 quality stats update (per trader per category from our resolves)
+            # SAVEPOINT wraps the entire settlement: status change + bankroll credit +
+            # category-stat update.  If the category update raises, everything rolls
+            # back together so the copy stays 'open' and is retried next run.
+            # _update_trader_cat_stat returns False (not raises) for duplicates, so a
+            # copy whose category was already counted by another model copy still settles.
+            c.execute("SAVEPOINT sp_settle")
             try:
+                c.execute("UPDATE copies SET status=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                           ("won" if won else "lost", 1.0 if won else 0.0, payout - stake, now_iso(), cid_id))
+                _credit(c, model, wallet, payout)  # proceeds back to this trader's wallet
+                # SDD v2 quality stats update (per trader per category from our resolves)
                 cat = categorize_market(title or "", "", "")
-                _update_trader_cat_stat(c, wallet, cat, won, payout - stake)
-            except Exception:
-                pass
-            settled += 1
+                source_key = copy_key.rsplit(":", 1)[0] if (copy_key and ":" in copy_key) else f"cid:{cid}:{wallet}"
+                # Canonical prediction PnL on standard $2.00 stake ($2*(1.0/entry-1) if won else -$2.00)
+                norm_pnl = (2.0 / entry - 2.0) if (won and entry > 0) else -2.0
+                _update_trader_cat_stat(c, wallet, cat, won, norm_pnl, source_key=source_key)
+                c.execute("RELEASE sp_settle")
+                settled += 1
+            except Exception as _exc:
+                # Roll back status change and bankroll credit atomically.
+                # Copy remains 'open'; will be retried on the next resolve() run.
+                c.execute("ROLLBACK TO sp_settle")
+                c.execute("RELEASE sp_settle")
+                print(f"resolve: settlement deferred for copy id={cid_id} ({_exc!r}); will retry next run")
+
         elif model == "exit":                     # Model B: take-profit / timeout exit
             gain = (cur - entry) / entry if entry > 0 else 0
             try:

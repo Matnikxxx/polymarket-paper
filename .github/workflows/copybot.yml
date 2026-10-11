@@ -48,7 +48,7 @@ jobs:
             timeout 200 python3 copybot.py claude_decide || true
             python3 copybot.py export || true
             # Only commit the tiny human-readable dashboard payload. DB lives in cache.
-            git add docs/data.json
+            git add docs/data.json docs/quality.json
             git diff --staged --quiet || { git commit -m "copybot $(date -u +%FT%TZ)"; \
               for a in 1 2 3; do git pull --rebase --autostash origin main || true; git push origin HEAD:main && break || sleep 5; done; }
           }

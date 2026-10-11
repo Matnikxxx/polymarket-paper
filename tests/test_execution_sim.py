@@ -9,10 +9,12 @@ No network and no real DB: order books are plain dicts in the shape the CLOB /bo
 endpoint returns, and each DB-touching test gets a throwaway temp sqlite file.
 Nothing here sleeps — the copy delay is timestamp arithmetic, which is the point.
 """
+import json
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import copybot  # noqa: E402
@@ -657,6 +659,387 @@ class Phase82FinancialMetricsExportTests(unittest.TestCase):
         # meta.total_unrealized matches sum of models
         self.assertEqual(data["meta"]["total_unrealized"],
                          round(sum(m["unrealized"] for m in models.values()), 2))
+
+
+class Phase810CategoryQualityTests(unittest.TestCase):
+    """Phase 8.10: Regression tests for Trader Edge Breakdown (Section F).
+    Verifies:
+    1. Valid classified result updates correct category statistics.
+    2. Unknown / unclassified titles fall back to 'other' without fabricating categories.
+    3. Strategy exits (exit_won, d_stop, etc.) do NOT update trader category statistics.
+    4. Market resolution deduplicates across Models A-E (5 model copies = 1 sample).
+    5. Repeated resolve runs are idempotent and cannot double-count.
+    6. docs/quality.json structure conforms to dashboard expectations.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self._orig_db = copybot.DB
+        copybot.DB = self._tmp.name
+        copybot.db()
+
+    def tearDown(self):
+        copybot.DB = self._orig_db
+        try:
+            os.unlink(self._tmp.name)
+        except OSError:
+            pass
+
+    def test_category_classification_rules(self):
+        """Verify market categorization mapping."""
+        self.assertEqual(copybot.categorize_market("NBA: Lakers vs Celtics"), "sports")
+        self.assertEqual(copybot.categorize_market("Will BTC reach 100k in 5m?"), "crypto_5m")
+        self.assertEqual(copybot.categorize_market("Will Trump win the election?"), "politics")
+        self.assertEqual(copybot.categorize_market("ETH price at end of 1 hour"), "crypto_h")
+        self.assertEqual(copybot.categorize_market("Will Alex Warren release a single in June?"), "other")
+
+    def test_market_resolution_updates_trader_stats_and_deduplicates(self):
+        """Verify market resolution updates stats once even if 5 models hold the copy."""
+        c = copybot.db()
+        trader = "GoalLineGhost"
+        base_key = "0xtx:0xasset:1780000000"
+        cid = "c_mkt_1"
+
+        # Insert 5 copies (Models A-E) for the same underlying trader trade
+        for model in ("hold", "exit", "cdecide", "trail", "chart"):
+            c.execute("""INSERT INTO copies(key,copied_ts,wallet,condition_id,asset,title,
+                outcome,outcome_index,their_price,entry,stake,shares,status,model)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (f"{base_key}:{model}", "2026-10-11T00:00:00Z", trader, cid, "0xasset",
+                 "NBA: Lakers vs Celtics", "Yes", 0, 0.50, 0.50, 2.0, 4.0, "open", model))
+        c.commit()
+
+        # Mock market returned from _market_by_condition
+        fake_market = {
+            "closed": True,
+            "outcomePrices": json.dumps(["1.0", "0.0"]),
+        }
+
+        with mock.patch("copybot._market_by_condition", return_value=fake_market):
+            copybot.resolve()
+
+        # Check copies were settled
+        rows = c.execute("SELECT status FROM copies WHERE condition_id=?", (cid,)).fetchall()
+        self.assertEqual(len(rows), 5)
+        for r in rows:
+            self.assertEqual(r[0], "won")
+
+        # Verify trader_cat_stats in DB has EXACTLY 1 trade, not 5
+        stat_row = c.execute("SELECT trades, wins, realized FROM trader_cat_stats WHERE trader=? AND category=?",
+                             (trader, "sports")).fetchone()
+        self.assertIsNotNone(stat_row)
+        self.assertEqual(stat_row[0], 1)  # 1 trade
+        self.assertEqual(stat_row[1], 1)  # 1 win
+        self.assertTrue(stat_row[2] > 0)  # positive realized PnL
+
+        # _get_trader_cat_quality returns trusted=False and wr=0.0 until MIN_CAT_TRADES (6) reached
+        q = copybot._get_trader_cat_quality(c, trader, "sports")
+        self.assertEqual(q["trades"], 1)
+        self.assertFalse(q["trusted"])  # below MIN_CAT_TRADES (6)
+
+        # Verify idempotency: running resolve again does not increment
+        with mock.patch("copybot._market_by_condition", return_value=fake_market):
+            copybot.resolve()
+
+        stat_row_after = c.execute("SELECT trades, wins FROM trader_cat_stats WHERE trader=? AND category=?",
+                                   (trader, "sports")).fetchone()
+        self.assertEqual(stat_row_after[0], 1)
+        self.assertEqual(stat_row_after[1], 1)
+
+    def test_strategy_exits_do_not_update_category_stats(self):
+        """Verify Model B take-profit / Model D stop exits do not record category prediction stats."""
+        c = copybot.db()
+        trader = "fox54498"
+        base_key = "0xtx2:0xasset2:1780000000"
+        cid = "c_mkt_2"
+
+        # Model B copy with cur > entry * 1.15 -> triggers exit_won
+        c.execute("""INSERT INTO copies(key,copied_ts,wallet,condition_id,asset,title,
+            outcome,outcome_index,their_price,entry,stake,shares,status,model)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (f"{base_key}:exit", "2026-10-11T00:00:00Z", trader, cid, "0xasset2",
+             "Will Donald Trump tweet tomorrow?", "Yes", 0, 0.50, 0.50, 2.0, 4.0, "open", "exit"))
+        c.commit()
+
+        # Unclosed market with current price 0.65 (+30% gain)
+        fake_market = {
+            "closed": False,
+            "outcomePrices": json.dumps(["0.65", "0.35"]),
+        }
+
+        with mock.patch("copybot._market_by_condition", return_value=fake_market):
+            copybot.resolve()
+
+        # Status should be exit_won
+        row = c.execute("SELECT status FROM copies WHERE key=?", (f"{base_key}:exit",)).fetchone()
+        self.assertEqual(row[0], "exit_won")
+
+        # trader_cat_stats for politics must remain 0 trades
+        q = copybot._get_trader_cat_quality(c, trader, "politics")
+        self.assertEqual(q["trades"], 0)
+
+    def test_quality_json_structure(self):
+        """Verify export writes docs/quality.json with expected schema."""
+        cwd = os.getcwd()
+        tmpdir = tempfile.mkdtemp()
+        try:
+            os.chdir(tmpdir)
+            copybot.export()
+            self.assertTrue(os.path.exists("docs/quality.json"))
+            with open("docs/quality.json") as f:
+                data = json.load(f)
+            self.assertIn("updated", data)
+            self.assertIn("quality", data)
+            self.assertEqual(len(data["quality"]), len(copybot.WALLETS))
+            for row in data["quality"]:
+                self.assertIn("name", row)
+                for cat in ("sports", "crypto_5m", "politics", "crypto_h", "other"):
+                    self.assertIn(cat, row)
+                    for key in ("trades", "wr", "roi", "trusted"):
+                        self.assertIn(key, row[cat])
+        finally:
+            os.chdir(cwd)
+
+    def test_atomicity_on_stats_update_failure(self):
+        """Regression: a failure between the dedup INSERT and the stats UPDATE must leave
+        neither a partial dedup record nor a partial stats row.  The trade must be
+        retryable and must ultimately count exactly once.
+
+        Failure is injected via a thin ConnectionProxy wrapper that raises
+        sqlite3.OperationalError on the first INSERT/UPDATE to trader_cat_stats.
+        sqlite3.Connection.execute is immutable in CPython 3.14+, so monkey-patching
+        the class is not possible; the proxy is passed directly to the function under
+        test instead.
+        """
+        import sqlite3 as _sqlite3
+
+        real_c = copybot.db()
+        trader = "mooseborzoi"
+        source_key = "0xfailtest:0xasset99:1780000001"
+        category = "sports"
+
+        # Thin proxy: delegates everything to the real connection but intercepts execute()
+        # to inject a one-shot failure on the first stats write.
+        class ConnectionProxy:
+            def __init__(self, conn):
+                self._conn = conn
+                self._fail_next_stats = True  # armed for one failure
+
+            def execute(self, sql, params=()):
+                sql_upper = sql.strip().upper()
+                if (self._fail_next_stats
+                        and "TRADER_CAT_STATS" in sql_upper
+                        and (sql_upper.startswith("INSERT") or sql_upper.startswith("UPDATE"))):
+                    self._fail_next_stats = False  # disarm after first injection
+                    raise _sqlite3.OperationalError("injected test failure")
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                # Delegate commit, rollback, close, and any other attribute to real conn
+                return getattr(self._conn, name)
+
+        proxy = ConnectionProxy(real_c)
+
+        # --- First attempt: stats write fails ---
+        with self.assertRaises(_sqlite3.OperationalError):
+            copybot._update_trader_cat_stat(proxy, trader, category, True, 2.0,
+                                            source_key=source_key)
+
+        # After failure: dedup row must NOT exist (savepoint rolled it back)
+        dedup_row = real_c.execute(
+            "SELECT source_key FROM trader_cat_resolved WHERE source_key=?",
+            (source_key,)).fetchone()
+        self.assertIsNone(dedup_row, "Dedup row must not persist after a failed stats update")
+
+        # After failure: stats row must NOT exist either
+        stat_row = real_c.execute(
+            "SELECT trades FROM trader_cat_stats WHERE trader=? AND category=?",
+            (trader, category)).fetchone()
+        self.assertIsNone(stat_row, "Stats row must not exist after a failed stats update")
+
+        # --- Second attempt (retry): use real connection directly, both writes must succeed ---
+        result = copybot._update_trader_cat_stat(real_c, trader, category, True, 2.0,
+                                                 source_key=source_key)
+        self.assertTrue(result, "Retry must return True (success)")
+
+        dedup_row = real_c.execute(
+            "SELECT source_key FROM trader_cat_resolved WHERE source_key=?",
+            (source_key,)).fetchone()
+        self.assertIsNotNone(dedup_row, "Dedup row must exist after successful retry")
+
+        stat_row = real_c.execute(
+            "SELECT trades, wins FROM trader_cat_stats WHERE trader=? AND category=?",
+            (trader, category)).fetchone()
+        self.assertIsNotNone(stat_row, "Stats row must exist after successful retry")
+        self.assertEqual(stat_row[0], 1, "Exactly 1 trade after first successful write")
+        self.assertEqual(stat_row[1], 1, "Exactly 1 win after first successful write")
+
+        # --- Third attempt (duplicate): must be idempotent ---
+        result2 = copybot._update_trader_cat_stat(real_c, trader, category, True, 2.0,
+                                                  source_key=source_key)
+        self.assertFalse(result2, "Duplicate attempt must return False")
+
+        stat_row_final = real_c.execute(
+            "SELECT trades, wins FROM trader_cat_stats WHERE trader=? AND category=?",
+            (trader, category)).fetchone()
+        self.assertEqual(stat_row_final[0], 1, "Trades must still be 1 after duplicate attempt")
+        self.assertEqual(stat_row_final[1], 1, "Wins must still be 1 after duplicate attempt")
+
+
+    def test_resolver_retry_on_category_stats_failure(self):
+        """Integration regression: when _update_trader_cat_stat raises during resolve(),
+        the affected copy must stay 'open' (sp_settle rolled back its status change),
+        while other model copies of the same trade settle normally and record the stat
+        exactly once.  A subsequent resolve() run must settle the deferred copy without
+        producing a second category-stats sample.
+        """
+        c = copybot.db()
+        trader = "AshHaykArs"
+        base_key = "0xretry:0xasset_r:1780000002"
+        cid = "c_retry"
+
+        # Insert 5 copies (Models A-E), same underlying trade.
+        # ORDER BY id DESC means the last-inserted model is processed first by resolve().
+        for model in ("hold", "exit", "cdecide", "trail", "chart"):
+            c.execute(
+                """INSERT INTO copies(key,copied_ts,wallet,condition_id,asset,title,
+                    outcome,outcome_index,their_price,entry,stake,shares,status,model)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (f"{base_key}:{model}", "2026-10-11T00:00:00Z", trader, cid,
+                 "0xasset_r", "NBA: Lakers vs Celtics", "Yes", 0,
+                 0.50, 0.50, 2.0, 4.0, "open", model))
+        c.commit()
+
+        # Closed market: outcome 0 wins.
+        fake_market = {"closed": True, "outcomePrices": json.dumps(["1.0", "0.0"])}
+
+        # Inject a failure on the very first call to _update_trader_cat_stat.
+        # The real implementation is bypassed for this call only; resolve()'s
+        # sp_settle savepoint rolls back that copy's status change.
+        call_count = [0]
+        real_update = copybot._update_trader_cat_stat
+
+        def failing_once(conn, trd, cat, w, pnl, source_key=None):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise sqlite3.OperationalError("injected stat failure")
+            return real_update(conn, trd, cat, w, pnl, source_key=source_key)
+
+        with mock.patch("copybot._update_trader_cat_stat", side_effect=failing_once):
+            with mock.patch("copybot._market_by_condition", return_value=fake_market):
+                copybot.resolve()
+
+        # Exactly one copy must remain 'open' (the one whose settlement was rolled back).
+        open_rows = c.execute(
+            "SELECT key FROM copies WHERE condition_id=? AND status='open'",
+            (cid,)).fetchall()
+        self.assertEqual(len(open_rows), 1, "Exactly one copy must be deferred (still open)")
+
+        # The other four must be settled.
+        settled_rows = c.execute(
+            "SELECT key FROM copies WHERE condition_id=? AND status='won'",
+            (cid,)).fetchall()
+        self.assertEqual(len(settled_rows), 4, "Four copies must be settled after first resolve")
+
+        # Category stat must have been recorded exactly once by one of the settled copies.
+        stat = c.execute(
+            "SELECT trades, wins FROM trader_cat_stats WHERE trader=? AND category=?",
+            (trader, "sports")).fetchone()
+        self.assertIsNotNone(stat, "Category stat must exist after partial resolve")
+        self.assertEqual(stat[0], 1, "Exactly 1 trade after partial resolve")
+        self.assertEqual(stat[1], 1, "Exactly 1 win after partial resolve")
+
+        # Second resolve() — no injected failure; deferred copy must settle cleanly.
+        with mock.patch("copybot._market_by_condition", return_value=fake_market):
+            copybot.resolve()
+
+        open_after = c.execute(
+            "SELECT key FROM copies WHERE condition_id=? AND status='open'",
+            (cid,)).fetchall()
+        self.assertEqual(len(open_after), 0, "No copies must remain open after retry")
+
+        won_after = c.execute(
+            "SELECT key FROM copies WHERE condition_id=? AND status='won'",
+            (cid,)).fetchall()
+        self.assertEqual(len(won_after), 5, "All five copies must be settled after retry")
+
+        # Category stat must still be exactly one sample — not double-counted.
+        stat_after = c.execute(
+            "SELECT trades, wins FROM trader_cat_stats WHERE trader=? AND category=?",
+            (trader, "sports")).fetchone()
+        self.assertEqual(stat_after[0], 1, "Trades must remain 1 after retry (no double-count)")
+        self.assertEqual(stat_after[1], 1, "Wins must remain 1 after retry (no double-count)")
+
+    def test_unrelated_integrity_error_propagates(self):
+        """Verify that an IntegrityError that is NOT a duplicate source_key is re-raised
+        rather than silently treated as a duplicate.
+
+        The proxy intercepts INSERT into trader_cat_resolved at the Python level without
+        the row ever reaching SQLite (simulating a non-PK constraint failure that leaves
+        no row behind).  The handler then confirms source_key is absent, and re-raises.
+        All other SQL (SAVEPOINT, ROLLBACK TO, RELEASE, SELECT) passes through to the
+        real connection so SQLite's savepoint stack stays consistent.
+        """
+        import sqlite3 as _sqlite3
+
+        # Use an explicit-transaction connection so SAVEPOINT nests predictably.
+        # isolation_level=None means autocommit; we issue BEGIN manually via the
+        # no-op DML that opens the Python implicit transaction.
+        real_c = copybot.db()
+        trader = "belaba"
+        source_key = "0xunrelated:0xbad:1780000003"
+        category = "sports"
+
+        class FakeIntegrityProxy:
+            """Raises IntegrityError on INSERT to trader_cat_resolved without sending
+            the statement to SQLite.  Everything else delegates to the real connection.
+            Critically, SAVEPOINT / ROLLBACK TO / RELEASE pass through so the SQLite
+            savepoint stack stays consistent with what _update_trader_cat_stat expects.
+            """
+            def __init__(self, conn):
+                self._conn = conn
+                self._armed = True
+
+            def execute(self, sql, params=()):
+                sql_upper = sql.strip().upper()
+                if (self._armed
+                        and sql_upper.startswith("INSERT")
+                        and "TRADER_CAT_RESOLVED" in sql_upper):
+                    self._armed = False
+                    # Raise before the row reaches SQLite — savepoint sp_cat is still
+                    # active on the real connection, so ROLLBACK TO sp_cat will work.
+                    raise _sqlite3.IntegrityError("simulated non-duplicate constraint error")
+                # All other statements (SAVEPOINT, ROLLBACK TO, RELEASE, SELECT, UPDATE)
+                # go directly to the real connection.
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        # Open a Python-level implicit transaction so SAVEPOINT sp_cat nests inside it.
+        # This mirrors the production path where resolve() issues UPDATE copies first.
+        real_c.execute("UPDATE trader_cat_stats SET trades=0 WHERE 1=0")  # no-op DML; opens BEGIN
+
+        proxy = FakeIntegrityProxy(real_c)
+
+        # The call must raise IntegrityError (not return False, not be swallowed).
+        with self.assertRaises(_sqlite3.IntegrityError):
+            copybot._update_trader_cat_stat(proxy, trader, category, True, 2.0,
+                                            source_key=source_key)
+
+        # Neither the dedup row nor the stats row must exist.
+        dedup = real_c.execute(
+            "SELECT 1 FROM trader_cat_resolved WHERE source_key=?",
+            (source_key,)).fetchone()
+        self.assertIsNone(dedup, "No dedup row must persist after unrelated IntegrityError")
+
+        stat = real_c.execute(
+            "SELECT trades FROM trader_cat_stats WHERE trader=? AND category=?",
+            (trader, category)).fetchone()
+        self.assertIsNone(stat, "No stats row must persist after unrelated IntegrityError")
+
+        real_c.rollback()  # discard the no-op DML that opened the transaction
 
 
 if __name__ == "__main__":
