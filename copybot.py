@@ -1372,6 +1372,7 @@ def export():
             lags.append(datetime.fromisoformat(ct).timestamp() - int(tt))
         except Exception:
             pass
+    lags.sort()
     lag_p50 = round(lags[len(lags)//2]/60, 1) if lags else None
 
     total_at_risk = sum(r["at_risk"] for r in [agg.get((mk, t), {"at_risk":0}) for t in WALLETS for mk,_ in MODELS])

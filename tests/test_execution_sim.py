@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -659,6 +660,69 @@ class Phase82FinancialMetricsExportTests(unittest.TestCase):
         # meta.total_unrealized matches sum of models
         self.assertEqual(data["meta"]["total_unrealized"],
                          round(sum(m["unrealized"] for m in models.values()), 2))
+
+    def test_export_meta_lag_p50_calculation(self):
+        """Regression test for Phase 5.7:
+        Verify meta.lag_p50_min accurately calculates the median of lag values
+        even when copies are stored/inserted in a deliberately non-sorted order.
+        Tests:
+        1. Deliberately unsorted lag dataset produces the correct sorted median.
+        2. Even-sized lag dataset follows existing convention (index len//2).
+        3. Empty dataset produces None.
+        """
+        c = copybot.db()
+        # Clean out any pre-existing copies in temporary DB
+        c.execute("DELETE FROM copies")
+        c.commit()
+
+        # 1. Empty test
+        cwd = os.getcwd()
+        tmpdir = tempfile.mkdtemp()
+        try:
+            os.chdir(tmpdir)
+            copybot.export()
+            with open("docs/data.json") as f:
+                data = json.load(f)
+            self.assertIsNone(data["meta"]["lag_p50_min"])
+
+            # 2. Odd-sized dataset with deliberately unsorted lags:
+            # Lags in seconds: [600, 60, 300, 1200, 180] -> in minutes: [10.0, 1.0, 5.0, 20.0, 3.0]
+            # Unsorted insertion order would take middle index [2] -> 300s (5.0 min).
+            # Sorted order: [60, 180, 300, 600, 1200] -> middle index [2] happens to be 300s (5.0 min).
+            # Let's use: [1200, 60, 1800, 600, 300] -> minutes: [20.0, 1.0, 30.0, 10.0, 5.0]
+            # Unsorted index [2] -> 1800s (30.0 min).
+            # Sorted: [60, 300, 600, 1200, 1800] -> index [2] is 600s (10.0 min).
+            # Base timestamp: 1780000000
+            base_ts = 1780000000
+            deliberate_lags = [1200, 60, 1800, 600, 300]
+            for idx, lag in enumerate(deliberate_lags):
+                copied_dt = datetime.fromtimestamp(base_ts + lag, timezone.utc).isoformat()
+                c.execute("""INSERT INTO copies(key,copied_ts,their_ts,status,model,wallet,stake)
+                    VALUES(?,?,?,'open','hold','fox54498',2.0)""",
+                    (f"lag_odd_{idx}", copied_dt, str(base_ts)))
+            c.commit()
+
+            copybot.export()
+            with open("docs/data.json") as f:
+                data = json.load(f)
+            # Correct sorted median is 600s / 60 = 10.0 minutes
+            self.assertEqual(data["meta"]["lag_p50_min"], 10.0)
+
+            # 3. Even-sized dataset: add one more lag of 60s
+            # Now lags are: [1200, 60, 1800, 600, 300, 60] -> sorted: [60, 60, 300, 600, 1200, 1800]
+            # len=6, len//2 = 3 -> index 3 is 600s (10.0 minutes).
+            c.execute("""INSERT INTO copies(key,copied_ts,their_ts,status,model,wallet,stake)
+                VALUES('lag_even_5',?,'1780000000','open','hold','fox54498',2.0)""",
+                (datetime.fromtimestamp(base_ts + 60, timezone.utc).isoformat(),))
+            c.commit()
+
+            copybot.export()
+            with open("docs/data.json") as f:
+                data = json.load(f)
+            self.assertEqual(data["meta"]["lag_p50_min"], 10.0)
+        finally:
+            os.chdir(cwd)
+
 
 
 class Phase810CategoryQualityTests(unittest.TestCase):
