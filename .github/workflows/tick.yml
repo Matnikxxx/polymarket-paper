@@ -9,10 +9,12 @@ on:
   workflow_dispatch: {}   # lets you run it manually from the Actions tab
 
 permissions:
-  contents: write   # so the job can commit trades.db back to the repo
+  contents: write   # so the job can publish any tracked change it produced
 
 concurrency:
-  group: tick       # serialize runs so two pushes never collide
+  # Shared with copybot.yml: any workflow that pushes to main must use the same
+  # group, otherwise two writers can race and one push is rejected.
+  group: main-writer
   cancel-in-progress: false
 
 jobs:
@@ -35,10 +37,18 @@ jobs:
           # The original fade-the-favorite experiment is largely concluded; this workflow
           # is kept for backfill + occasional report runs only. State is ephemeral per run
           # or can be re-derived via `paper_trader.py backfill`.
-          if git diff --staged --quiet; then
-            echo "no change this run"
-          else
-            git commit -m "tick $(date -u +%FT%TZ)"
-            git pull --rebase --autostash origin main || true
-            git push
+          #
+          # NOTE: the old version tested `git diff --staged --quiet` without ever running
+          # `git add`, so it ALWAYS reported "no change" - the commit/push branch below was
+          # dead code (and `git push` on a detached HEAD would have failed anyway). Stage
+          # tracked modifications explicitly, then publish with the same rebase-free helper
+          # copybot uses.
+          git add --update
+          changed=$(git diff --cached --name-only)
+          if [ -z "$changed" ]; then
+            echo "no tracked file changed this run - nothing to publish"
+            exit 0
           fi
+          echo "publishing: $changed"
+          # shellcheck disable=SC2086
+          python3 publish_dashboard.py $changed --message "tick $(date -u +%FT%TZ)"
