@@ -11,8 +11,12 @@ on:
 permissions:
   contents: write
 
+# Every workflow that PUSHES to main must share one concurrency group, otherwise
+# two jobs can publish at the same time and one of them loses the push race.
+# (Previously this group was `copybot` while paper-trader-tick used `tick`, so the
+# two writers were not coordinated at all.)
 concurrency:
-  group: copybot
+  group: main-writer
   cancel-in-progress: false
 
 jobs:
@@ -37,46 +41,27 @@ jobs:
           restore-keys: |
             copybot-db-
 
-      - name: tick + flush dashboard every ~9 min (resolve + claude + export + commit)
+      - name: tick + flush dashboard every ~9 min (resolve + claude + export + publish)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           git config user.name "copybot"
           git config user.email "bot@users.noreply.github.com"
+          # Publication is done by publish_dashboard.py: it fetches the CURRENT
+          # origin/main tip, rebuilds the dashboard commit on top of it and pushes.
+          # It never rebases/merges/force-pushes, so the old
+          # "CONFLICT (content): Merge conflict in docs/data.json" loop is gone, and a
+          # run that was queued for an hour can no longer fail to publish.
           flush(){
             timeout 200 python3 copybot.py resolve || true
             timeout 200 python3 copybot.py claude_decide || true
             python3 copybot.py export || true
-            # Only commit the tiny human-readable dashboard payload. DB lives in cache.
-            git add docs/data.json docs/quality.json
-            git diff --staged --quiet || {
-              if git commit -m "copybot $(date -u +%FT%TZ)"; then
-                pushed=0
-                for a in 1 2 3; do
-                  # Abort any prior in-progress rebase before retrying pull
-                  if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
-                    git rebase --abort 2>/dev/null || true
-                  fi
-                  if git pull --rebase --autostash origin main; then
-                    if git push origin HEAD:main; then
-                      pushed=1
-                      break
-                    fi
-                  else
-                    # Pull/rebase conflict or error: abort rebase cleanly to leave tree clean
-                    git rebase --abort 2>/dev/null || true
-                  fi
-                  sleep 5
-                done
-                if [ "$pushed" -ne 1 ]; then
-                  echo "::error::flush: failed to push dashboard commit after 3 attempts"
-                  echo "publication_failed=1" >> "$GITHUB_ENV"
-                fi
-              else
-                echo "::error::flush: git commit failed; skipping push"
-                echo "publication_failed=1" >> "$GITHUB_ENV"
-              fi
-            }
+            # Only publish the tiny human-readable dashboard payload. DB lives in cache.
+            if ! python3 publish_dashboard.py docs/data.json docs/quality.json \
+                   --message "copybot $(date -u +%FT%TZ)"; then
+              echo "::error::flush: failed to publish dashboard commit"
+              echo "publication_failed=1" >> "$GITHUB_ENV"
+            fi
           }
           for i in $(seq 1 10); do
             echo "--- tick $i/10 ($(date -u +%T)) ---"

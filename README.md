@@ -53,6 +53,9 @@ The runner pushes fresh data (every ~9 min during the long job). The page auto-r
 - GitHub Actions **cache** carries DB state (open copies, bankrolls, decisions) between runs (see workflow). No more giant binary commits to the repo history.
 - Self-healing: `tick` only inserts buys that it has not seen yet (keyed on tx+asset+model). Missed runs or throttled crons lose nothing.
 - The original `paper-trader-tick` (the fade strat) is still wired but largely retired. It proved the point.
+- Dashboard publishing is handled by `publish_dashboard.py`, which always builds its commit on top of the
+  *current* `origin/main` tip (no `git pull --rebase`) and skips itself if a newer snapshot is already live.
+  Both writing workflows share one `main-writer` concurrency group, so they never publish simultaneously.
 
 Cost: free (public repo + tiny runners). The bot rate-caps Claude Haiku calls per run, and the calls are cheap.
 
@@ -97,6 +100,7 @@ More data comes first. A model plus a subset of traders must show persistent pos
 - `paper_trader.py`: the original fade experiment (mostly historical now)
 - `docs/index.html` + `docs/data.json`: the entire public dashboard (pure static, zero backend, Manrope + quiet dark per the design system)
 - `.github/workflows/copybot.yml`: the reliable near-continuous runner + cache for state
+- `publish_dashboard.py`: rebase-free dashboard publisher (fetch tip -> rebuild -> fast-forward push)
 - `copybot.db` (local only, gitignored): working state for the runner
 
 ---
