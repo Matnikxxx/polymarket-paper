@@ -112,7 +112,7 @@ WALLETS = {
     "molodoyy":      "0x564f22744b7941ade18d5e0e4f347c30e3057026",  # +$3.0k, 256 mkts, $57 clip
     "Tee1000":       "0x5edc7bba7516cd28dc886ad576ba197bb114bbad",  # +$23k, 494 mkts (experimental)
     "Polkadot-Frog": "0x9d57c42e847173d06841703825d3fe2299e456ea",  # +$20k, 497 mkts (experimental)
-    "MILKinDenial":  "0xb02188c268290bb758d6c261bdf4e552c6e1ebd9",  # +$8.7k, 498 mkts (experimental)
+    "abc51001":  "0xc16e1477bec0d3970b8bba3a6ea9faea73918f62",  # +$8.7k, 498 mkts (experimental)
     "Eatpraylove":   "0xc02147dee42356b7a4edbb1c35ac4ffa95f61fa8",  # +$136k whale (experimental)
 }
 
