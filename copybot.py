@@ -103,7 +103,7 @@ WALLETS = {
     "gopfan2":       "0xf2f6af4f27ec2dcf4072095ab804016e14cd5817",
     "HolyMoses7":    "0xa4b366ad22fc0d06f1e934ff468e8922431a87b8",  # lottery acct ($1->$1M goal)
     # --- Dune-sweep quiet winners (vetted from 1,617 active wallets, 2026-06-12) ---
-    "AJSV":          "0xad5353afe30c2da57709e2704ef3ccdcf67eef24",  # +$7.9k, 500 mkts, $18 clip
+    "ARocky33":          "0x00110b8ef00db2a1a6bbe1198e52fc4eb5a84333",  # +$7.9k, 500 mkts, $18 clip
     "AshHaykArs":    "0xd0ac6e6b585c00042a0552a6cf35f2f056ef7dee",  # +$1.9k, 38 mkts, $15 clip
     "zerowander01":  "0xa30de80ba9d6cc3c2d79955b6dca38307bf941af",  # +$224, 152 mkts, $4 clip (micro)
     "ElMagoCS2":     "0xf67948563be54a8a6aa0ab7b976d80e8f7e92d3d",  # +$404, 30 mkts, $14 clip
