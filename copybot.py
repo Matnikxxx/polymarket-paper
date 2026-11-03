@@ -103,16 +103,16 @@ WALLETS = {
     "gopfan2":       "0xf2f6af4f27ec2dcf4072095ab804016e14cd5817",
     "HolyMoses7":    "0xa4b366ad22fc0d06f1e934ff468e8922431a87b8",  # lottery acct ($1->$1M goal)
     # --- Dune-sweep quiet winners (vetted from 1,617 active wallets, 2026-06-12) ---
-    "ARocky33":          "0x00110b8ef00db2a1a6bbe1198e52fc4eb5a84333",  # +$7.9k, 500 mkts, $18 clip
+    "ARocky33":      "0x00110b8ef00db2a1a6bbe1198e52fc4eb5a84333",  # +$7.9k, 500 mkts, $18 clip
     "AshHaykArs":    "0xd0ac6e6b585c00042a0552a6cf35f2f056ef7dee",  # +$1.9k, 38 mkts, $15 clip
-    "zerowander01":  "0xa30de80ba9d6cc3c2d79955b6dca38307bf941af",  # +$224, 152 mkts, $4 clip (micro)
+    "cat-dog":       "0x7056f248c5098cce2fb0a062cdd2ab0f8318c95c",  # +$224, 152 mkts, $4 clip (micro)
     "ElMagoCS2":     "0xf67948563be54a8a6aa0ab7b976d80e8f7e92d3d",  # +$404, 30 mkts, $14 clip
-    "fox54498":      "0x54498e4c40b17261479aeaeeddf9cc37bd46992b",  # +$456, 362 mkts, $20 clip
+    "chongchong37":  "0x2879ded7fe05df00eddbb2fba412a0d30964411a",  # +$456, 362 mkts, $20 clip
     "belaba":        "0xb1556d9d1a734508178d15ba822e579901a7ca84",  # +$295, 21 mkts, $38 clip
     "molodoyy":      "0x564f22744b7941ade18d5e0e4f347c30e3057026",  # +$3.0k, 256 mkts, $57 clip
     "Tee1000":       "0x5edc7bba7516cd28dc886ad576ba197bb114bbad",  # +$23k, 494 mkts (experimental)
     "Polkadot-Frog": "0x9d57c42e847173d06841703825d3fe2299e456ea",  # +$20k, 497 mkts (experimental)
-    "abc51001":  "0xc16e1477bec0d3970b8bba3a6ea9faea73918f62",  # +$8.7k, 498 mkts (experimental)
+    "abc51001":      "0xc16e1477bec0d3970b8bba3a6ea9faea73918f62",  # +$8.7k, 498 mkts (experimental)
     "Eatpraylove":   "0xc02147dee42356b7a4edbb1c35ac4ffa95f61fa8",  # +$136k whale (experimental)
 }
 
