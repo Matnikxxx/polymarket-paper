@@ -36,8 +36,11 @@ class TestCopytradeROI(unittest.TestCase):
     def _run_copytest(self, trades, history_map, addr="0xtrader", lag_min=10):
         """Helper to run copytest() with mocked get() and captured stdout."""
         def mock_get(url):
-            if "/trades?user=" in url:
-                return trades
+            # v2 (the migrated route): cursor-paginated, wrapped in {data, pagination}.
+            if "/v2/trades?user=" in url:
+                return {"data": trades,
+                        "pagination": {"limit": len(trades), "offset": 0,
+                                       "has_more": False, "next_cursor": None}}
             for pattern, hist in history_map.items():
                 if pattern in url:
                     return {"history": hist}
@@ -66,7 +69,7 @@ class TestCopytradeROI(unittest.TestCase):
         trades = [
             {
                 "side": "BUY",
-                "asset": "tok_win",
+                "token_id": "tok_win",
                 "timestamp": str(ts),
                 "price": "0.40",
             }
@@ -109,7 +112,7 @@ class TestCopytradeROI(unittest.TestCase):
         trades = [
             {
                 "side": "BUY",
-                "asset": "tok_loss",
+                "token_id": "tok_loss",
                 "timestamp": str(ts),
                 "price": "0.40",
             }
@@ -145,7 +148,7 @@ class TestCopytradeROI(unittest.TestCase):
         trades = [
             {
                 "side": "BUY",
-                "asset": "tok_dip",
+                "token_id": "tok_dip",
                 "timestamp": str(ts),
                 "price": "0.50",
             }
@@ -178,13 +181,15 @@ class TestCopytradeROI(unittest.TestCase):
         ts2 = 1700010000
         lag_min = 10
         trades = [
-            {"side": "BUY", "asset": "tok_1", "timestamp": str(ts1), "price": "0.40"},
-            {"side": "BUY", "asset": "tok_2", "timestamp": str(ts2), "price": "0.60"},
+            {"side": "BUY", "token_id": "tok_1", "timestamp": str(ts1), "price": "0.40"},
+            {"side": "BUY", "token_id": "tok_2", "timestamp": str(ts2), "price": "0.60"},
         ]
 
         def mock_get(url):
-            if "/trades?user=" in url:
-                return trades
+            if "/v2/trades?user=" in url:
+                return {"data": trades,
+                        "pagination": {"limit": len(trades), "offset": 0,
+                                       "has_more": False, "next_cursor": None}}
             if "market=tok_1" in url and "fidelity=60" in url:
                 return {"history": [{"t": ts1 + 3600, "p": 1.00}]}
             if "market=tok_1" in url and "fidelity=1" in url:
@@ -211,10 +216,10 @@ class TestCopytradeROI(unittest.TestCase):
         """Non-buys, invalid prices, and unresolved markets are safely skipped."""
         ts = 1700000000
         trades = [
-            {"side": "SELL", "asset": "tok_sell", "timestamp": str(ts), "price": "0.50"},
+            {"side": "SELL", "token_id": "tok_sell", "timestamp": str(ts), "price": "0.50"},
             {"side": "BUY", "asset": "", "timestamp": str(ts), "price": "0.50"},
-            {"side": "BUY", "asset": "tok_bad_px", "timestamp": str(ts), "price": "1.50"},
-            {"side": "BUY", "asset": "tok_unresolved", "timestamp": str(ts), "price": "0.50"},
+            {"side": "BUY", "token_id": "tok_bad_px", "timestamp": str(ts), "price": "1.50"},
+            {"side": "BUY", "token_id": "tok_unresolved", "timestamp": str(ts), "price": "0.50"},
         ]
         history_map = {
             "tok_unresolved": [{"t": ts + 3600, "p": 0.50}],  # 0.05 <= p <= 0.95 -> open
@@ -222,6 +227,24 @@ class TestCopytradeROI(unittest.TestCase):
 
         output = self._run_copytest(trades, history_map)
         self.assertIn("no resolved buys to test (skipped 3", output)
+
+    def test_copytrade_never_calls_retired_v1_routes(self):
+        """Regression: v1 /trades and /value are gone (HTTP 410); every call is v2."""
+        seen = []
+
+        def mock_get(url):
+            seen.append(url)
+            if "/v2/trades?user=" in url:
+                return {"data": [], "pagination": {"has_more": False, "next_cursor": None}}
+            raise AssertionError(f"Unexpected URL called: {url}")
+
+        with mock.patch("copytrade.get", side_effect=mock_get):
+            with mock.patch("sys.stdout", io.StringIO()):
+                copytrade.copytest("0xtrader", lag_min=10)
+        self.assertTrue(seen)
+        for url in seen:
+            self.assertIn("/v2/", url)
+            self.assertNotIn("offset=", url)
 
     def test_contrast_demonstrating_bug_is_resolved(self):
         """
