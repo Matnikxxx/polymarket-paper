@@ -12,14 +12,24 @@ Commands:
   python3 copytrade.py leaderboard [window]      # top traders (window: 1d|7d|30d|all)
   python3 copytrade.py profile <wallet>          # skill snapshot for one wallet
   python3 copytrade.py copytest <wallet> [lag_min]  # THE test: lag-adjusted mirror ROI
+
+Data source: Polymarket Data API **v2** (`/v2/trades`, `/v2/value`). The v1 routes this
+tool used (`/trades?user=...` with an `offset` parameter, and `/value?user=...`) were
+retired on 2026-11-02 and answer HTTP 410. v2 returns everything in a `{"data": ...}`
+envelope, uses snake_case field names, and paginates with an opaque cursor
+(`pagination.next_cursor`) instead of `offset` — sending an `offset` parameter at all is
+a 400. Read-only analysis either way: no keys, no orders.
 """
 import json
 import sys
+import urllib.parse
 import urllib.request
 
 LB = "https://lb-api.polymarket.com"
 DATA = "https://data-api.polymarket.com"
+DATA_V2 = DATA + "/v2"
 CLOB = "https://clob.polymarket.com"
+TRADES_MAX_PAGES = 20      # hard cap on cursor pages per wallet walk
 
 
 def get(url):
@@ -39,25 +49,53 @@ def leaderboard(window="30d", limit=20):
     return rows
 
 
+def _v2_items(path, params):
+    """GET a v2 route and return (items, pagination) from the `{data, pagination}` envelope.
+
+    A documented miss is `data: []`/`null`; anything without `data` is a schema error and
+    raises rather than being read as "no data"."""
+    doc = get(f"{DATA_V2}{path}?{urllib.parse.urlencode(params)}")
+    if not isinstance(doc, dict) or "data" not in doc:
+        raise ValueError(f"{path}: unexpected v2 response shape: {type(doc).__name__}")
+    items = doc.get("data") or []
+    if not isinstance(items, list):
+        raise ValueError(f"{path}: 'data' is not a list")
+    pag = doc.get("pagination")
+    return items, (pag if isinstance(pag, dict) else {})
+
+
 def wallet_trades(addr, max_trades=600):
-    out, off = [], 0
-    while len(out) < max_trades:
-        t = get(f"{DATA}/trades?user={addr}&limit=500&offset={off}")
-        if not t:
+    """Newest-first trades for one wallet, via v2 cursor pagination.
+
+    The cursor is opaque and single-use per page: `offset` is gone, so the walk follows
+    `pagination.next_cursor` until it is null (or until we have enough trades / hit our
+    own page cap, which keeps the volume of requests bounded)."""
+    out, cursor, pages = [], None, 0
+    while len(out) < max_trades and pages < TRADES_MAX_PAGES:
+        params = {"user": addr, "limit": 500}
+        if cursor:
+            params["cursor"] = cursor
+        items, pag = _v2_items("/trades", params)
+        pages += 1
+        out += items
+        cursor = pag.get("next_cursor")
+        if not pag.get("has_more") or not cursor or not items:
             break
-        out += t
-        off += 500
-        if len(t) < 500:
-            break
-    return out
+    return out[:max_trades]
 
 
 def profile(addr):
-    val = get(f"{DATA}/value?user={addr}")
-    cur_value = val[0].get("value") if val else 0
+    # v2 wraps the value in an envelope: {"data": {"value": 538908.85, ...}}.
+    # v1 returned a bare list of rows, which no longer exists.
+    payload, _ = _v2_items("/value", {"user": addr})
+    cur_value = 0
+    if isinstance(payload, dict):
+        cur_value = payload.get("value") or 0
+    elif isinstance(payload, list) and payload:
+        cur_value = payload[0].get("value") or 0
     trades = wallet_trades(addr, 1000)
     buys = [t for t in trades if t.get("side") == "BUY"]
-    markets = {t.get("conditionId") for t in trades}
+    markets = {t.get("condition_id") for t in trades}
     avg_size = sum(float(t["size"]) * float(t["price"]) for t in trades) / max(len(trades), 1)
     print(f"\n  PROFILE {addr}")
     print("  " + "-" * 56)
@@ -85,7 +123,7 @@ def copytest(addr, lag_min=10, max_trades=80):
     their_roi, your_roi, your_wins = [], [], 0
     resolved, skipped = 0, 0
     for t in buys:
-        asset = t.get("asset")
+        asset = t.get("token_id")          # v2: token_id (v1 called it `asset`)
         ts = int(t["timestamp"])
         their_px = float(t["price"])
         if not asset or their_px <= 0 or their_px >= 1:

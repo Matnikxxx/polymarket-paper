@@ -419,7 +419,8 @@ class TickIntegrationTests(unittest.TestCase):
         copybot.WALLETS.clear()
         copybot.WALLETS["tester"] = "0xdead"
         self._saved = (copybot.get, copybot._market_by_condition, copybot.chart_signal,
-                       copybot._fetch_book, copybot._price_at)
+                       copybot._fetch_book, copybot._price_at,
+                       copybot.fetch_wallet_activity)
         # Phase 6: chart_signal None is now fail-closed; return a neutral passing signal so
         # these tick integration tests (which verify all 5 models receive a copy) still work.
         _neutral_sig = {
@@ -429,14 +430,14 @@ class TickIntegrationTests(unittest.TestCase):
             "vol_1h": 1000.0, "vol_15m": 250.0,
             "vol_ratio": 1.0, "buy_pressure": 0.50, "vwap": 0.50,
         }
-        copybot.chart_signal = lambda asset: _neutral_sig
+        copybot.chart_signal = lambda asset, condition_id=None: _neutral_sig
 
     def tearDown(self):
         copybot.DB = self._old_db
         copybot.WALLETS.clear()
         copybot.WALLETS.update(self._old_wallets)
         (copybot.get, copybot._market_by_condition, copybot.chart_signal,
-         copybot._fetch_book, copybot._price_at) = self._saved
+         copybot._fetch_book, copybot._price_at, copybot.fetch_wallet_activity) = self._saved
         try:
             os.unlink(self._tmp)
         except OSError:
@@ -444,12 +445,24 @@ class TickIntegrationTests(unittest.TestCase):
 
     def _wire(self, price, timestamp, end_iso, book_result=DEEP, exec_price=None,
               duplicate=False):
-        act = {"type": "TRADE", "side": "BUY", "timestamp": timestamp,
-               "transactionHash": "0xtx1", "conditionId": "cond1", "asset": "asset1",
-               "outcomeIndex": 0, "price": price, "title": "Will X happen?",
+        # v2 activity record (snake_case), mapped by copybot.map_v2_trade. `duplicate`
+        # models the feed returning the SAME fill twice (v2 does this for multi-leg fills),
+        # which must still produce exactly one candidate per (tx, asset, ts).
+        act = {"proxy_wallet": "0xdead", "type": "TRADE", "side": "BUY",
+               "timestamp": timestamp, "transaction_hash": "0xtx1",
+               "condition_id": "cond1", "token_id": "asset1", "outcome_index": 0,
+               "price": price, "size": 20.0, "title": "Will X happen?",
                "outcome": "Yes", "slug": "will-x-happen"}
-        activity = [act, dict(act)] if duplicate else [act]
-        copybot.get = lambda url: activity if "/activity" in url else (_ for _ in ()).throw(
+        records = [act, dict(act)] if duplicate else [act]
+        feed = {"trades": [], "pages": 1, "complete": True, "truncated": False,
+                "rejected": {}, "rejected_sample": []}
+        for rec in records:
+            trade, reason = copybot.map_v2_trade(rec, "tester", "0xdead")
+            if trade is not None:
+                feed["trades"].append(trade)
+        self._feed = feed
+        copybot.fetch_wallet_activity = lambda addr, since_ts, **kw: feed
+        copybot.get = lambda url: (_ for _ in ()).throw(
             AssertionError(f"unexpected get(): {url}"))
         copybot._market_by_condition = lambda cid: {
             "outcomePrices": copybot.json.dumps([price, 1 - price]),

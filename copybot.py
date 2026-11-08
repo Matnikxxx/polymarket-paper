@@ -23,14 +23,43 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 DATA = "https://data-api.polymarket.com"
+DATA_V2 = DATA + "/v2"          # Data API v2 (v1 was retired on 2026-11-02 -> HTTP 410)
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 DB = Path(__file__).parent / "copybot.db"
+
+# === Data API v2 client settings (everything the migration needs is configurable) ===
+# Page size for the wallet activity feed. v2 caps `limit` at 1000 and rejects anything
+# past the cap, so stay well inside it. Deeper pages come from `pagination.next_cursor`.
+ACTIVITY_PAGE_LIMIT = 250
+# Hard cap on pages walked per wallet per tick. Newest-first ordering means a truncated
+# walk still sees the freshest trades; the truncation is reported, never silent.
+ACTIVITY_MAX_PAGES = 4
+# How far back each tick asks the feed. Must exceed MAX_TRADE_AGE_SEC (the freshness gate
+# below) so a trade that is still copyable can never be missing from the window.
+ACTIVITY_LOOKBACK_SEC = 60 * 60
+# Network timeouts / retries for v2. 429 and 503 carry `Retry-After`; a 4xx that is not
+# retryable (e.g. 400 invalid_request, 410 gone) is raised immediately, never retried.
+HTTP_TIMEOUT_SEC = 25
+API_MAX_ATTEMPTS = 3
+API_RETRY_BASE_SEC = 2.0
+API_RETRY_MAX_SEC = 30.0
+RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+# Model E volume feed: how many market trades to pull before filtering to this token and
+# to the last hour. Same order of magnitude the v1 call used (limit=500).
+CHART_VOLUME_TRADE_LIMIT = 500
+# `outcome_index: 999` is the documented "outcome could not be labeled" sentinel, and a
+# missing numeric field means "unavailable", never zero. Neither is safe to copy on: the
+# outcome is what selects the price and the settlement leg. Such trades are skipped and
+# counted, so they can never be silently copied against the wrong outcome.
+V2_OUTCOME_UNLABELED = 999
 # REAL $20 wallet per model: each model starts with $20, bets $2/trade (so up to ~10
 # positions at once), and can only open a copy if it has free cash. When a position
 # closes, the proceeds return to the wallet to be reused (recycling).
@@ -123,6 +152,270 @@ def get(url):
         return json.loads(r.read().decode())
 
 
+# === Data API v2 transport ==================================================
+# The v1 feeds (`/activity`, `/trades`, `/value`) were retired on 2026-11-02 and now
+# answer HTTP 410 for every request. v2 differs in three ways that this layer owns:
+#   1. every payload is wrapped in an envelope: {"data": ..., "pagination": {...}}
+#   2. field names are snake_case (transaction_hash, condition_id, token_id, ...)
+#   3. pagination is cursor-only: follow pagination.next_cursor until null. There is no
+#      `offset` parameter; sending one is a 400. Filters must be re-sent unchanged on
+#      every page, because changing one mid-walk silently re-anchors the cursor.
+# A failure is NEVER converted into an empty list here: an empty page means "this wallet
+# genuinely has no trades in the window", and a failure means "we do not know". The
+# caller (tick) reports the two differently, so 410/429/503 can never look like
+# "zero new trades".
+class DataApiError(RuntimeError):
+    """A Data API v2 request that did not produce a usable page.
+
+    Carries the documented error contract (`code`, `retryable`, `trace_id`) plus the
+    HTTP status and any `Retry-After` hint, so the caller can tell a transient outage
+    apart from a hard, non-retryable rejection (400/410)."""
+
+    def __init__(self, message, status=None, code=None, retryable=None,
+                 trace_id=None, url=None, retry_after=None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.retryable = retryable
+        self.trace_id = trace_id
+        self.url = url
+        self.retry_after = retry_after
+
+    def is_retryable(self):
+        if self.retryable is not None:
+            return bool(self.retryable)
+        return self.status in RETRYABLE_STATUS or self.status is None
+
+
+def _retry_after_seconds(raw):
+    """`Retry-After` is documented in seconds; tolerate a missing/!numeric header."""
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return val if val >= 0 else None
+
+
+def _v2_get_json(url):
+    """GET one v2 URL and return the decoded JSON body, or raise DataApiError.
+
+    Transport errors, non-2xx statuses and unparseable bodies all raise: there is no
+    path here that returns an empty result on failure."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0",
+                                               "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        detail = {}
+        try:
+            parsed = json.loads(exc.read().decode())
+            if isinstance(parsed, dict):
+                detail = parsed
+        except Exception:
+            detail = {}
+        raise DataApiError(
+            "HTTP %s%s" % (exc.code, (" " + str(detail["error"])) if detail.get("error") else ""),
+            status=exc.code, code=detail.get("code"), retryable=detail.get("retryable"),
+            trace_id=detail.get("trace_id"), url=url,
+            retry_after=_retry_after_seconds(exc.headers.get("Retry-After")
+                                             if exc.headers else None))
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise DataApiError("network error: %s" % (exc,), retryable=True, url=url)
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise DataApiError("malformed JSON body: %s" % (exc,), retryable=True, url=url)
+
+
+def api_get(path, params, max_attempts=None):
+    """GET `path` (e.g. "/activity") on the v2 host with retries, returning raw JSON.
+
+    Retries only what v2 documents as retryable: 429/503 and the network-level failures.
+    429/503 are honoured via `Retry-After`. Everything else (400 invalid_request,
+    410 gone, a bad cursor, a malformed wallet) raises on the first attempt."""
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    url = "%s%s%s" % (DATA_V2, path, ("?" + query) if query else "")
+    attempts = max_attempts or API_MAX_ATTEMPTS
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _v2_get_json(url)
+        except DataApiError as exc:
+            if attempt >= attempts or not exc.is_retryable():
+                raise
+            delay = exc.retry_after
+            if delay is None:
+                delay = API_RETRY_BASE_SEC * (2 ** (attempt - 1))
+            time.sleep(max(0.0, min(float(delay), API_RETRY_MAX_SEC)))
+
+
+def unwrap_v2_page(doc, what="page"):
+    """Split a v2 response into (items, pagination) and validate the envelope.
+
+    `{"data": []}` / `{"data": null}` is the documented zero-state and yields []. A body
+    without `data`, or a `data` that is not a list, is a schema violation -> DataApiError
+    (so it is reported, not mistaken for "no trades")."""
+    if not isinstance(doc, dict):
+        raise DataApiError("%s: response is not a JSON object" % what, url=what)
+    if "data" not in doc:
+        raise DataApiError("%s: v2 envelope has no 'data' field" % what, url=what)
+    items = doc.get("data")
+    if items is None:
+        items = []
+    if not isinstance(items, list):
+        raise DataApiError("%s: 'data' is %s, expected a list"
+                           % (what, type(items).__name__), url=what)
+    pagination = doc.get("pagination")
+    if not isinstance(pagination, dict):
+        pagination = {}
+    return items, pagination
+
+
+def map_v2_trade(rec, wallet_name, wallet_addr):
+    """Map one v2 activity/trade record onto this bot's internal trade schema.
+
+    Returns (trade, None) on success or (None, reason) when the record cannot be copied
+    safely. The internal schema is the one `copies` already stores:
+        ts             -> copies.their_ts        (integer epoch seconds)
+        condition_id   -> copies.condition_id
+        asset          -> copies.asset           (the CLOB token id)
+        outcome_index  -> copies.outcome_index
+        price          -> copies.their_price
+        title/outcome  -> copies.title/outcome
+        tx             -> part of copies.key      (base key tx:asset:ts)
+    Wallet attribution is structural: the caller passes the tracked wallet it asked for,
+    and a record whose `proxy_wallet` disagrees is rejected instead of being credited to
+    the wrong wallet."""
+    if not isinstance(rec, dict):
+        return None, "not_an_object"
+    # Wallet attribution check (only when the feed actually reports the wallet).
+    proxy = rec.get("proxy_wallet")
+    if proxy not in (None, "") and str(proxy).strip().lower() != str(wallet_addr).strip().lower():
+        return None, "wallet_mismatch"
+    if str(rec.get("type") or "TRADE").strip().upper() != "TRADE":
+        return None, "not_a_trade"
+    side = str(rec.get("side") or "").strip().upper()
+    if side != "BUY":
+        return None, "not_a_buy"
+    tx = rec.get("transaction_hash")
+    if not isinstance(tx, str) or not tx.strip():
+        return None, "missing_transaction_hash"
+    asset = rec.get("token_id")
+    if asset in (None, "") or not str(asset).strip():
+        return None, "missing_token_id"
+    cid = rec.get("condition_id")
+    if cid in (None, "") or not str(cid).strip():
+        return None, "missing_condition_id"
+    try:
+        ts = int(rec.get("timestamp"))
+    except (TypeError, ValueError):
+        return None, "bad_timestamp"
+    try:
+        price = float(rec.get("price"))
+        size = float(rec.get("size") or 0.0)
+    except (TypeError, ValueError):
+        return None, "bad_price"
+    if not (price > 0.0 and price < 1.0):
+        return None, "price_out_of_range"
+    oidx_raw = rec.get("outcome_index")
+    if oidx_raw is None:
+        return None, "missing_outcome_index"
+    try:
+        oidx = int(oidx_raw)
+    except (TypeError, ValueError):
+        return None, "bad_outcome_index"
+    if oidx == V2_OUTCOME_UNLABELED:
+        return None, "outcome_unlabelled"      # documented "could not be labeled" sentinel
+    if oidx not in (0, 1):
+        return None, "bad_outcome_index"
+    return {
+        "ts": ts,
+        "tx": tx.strip(),
+        "condition_id": str(cid).strip(),
+        "asset": str(asset).strip(),
+        "outcome_index": oidx,
+        "price": price,
+        "size": size,
+        "title": str(rec.get("title") or ""),
+        "outcome": str(rec.get("outcome") or ""),
+        "slug": str(rec.get("slug") or ""),
+        "side": side,
+        "type": "TRADE",
+        "wallet_name": wallet_name,
+        "wallet_addr": wallet_addr,
+    }, None
+
+
+def fetch_wallet_activity(addr, since_ts, page_limit=None, max_pages=None,
+                          wallet_name=None):
+    """Walk one wallet's v2 activity feed, newest first, and return its mapped trades.
+
+    Returns a dict:
+        trades      list of mapped trades
+        pages       pages actually walked
+        complete    True when the walk ended on the feed's own end (next_cursor null)
+        truncated   True when our own page cap stopped a still-has_more walk
+        rejected    {reason: count} for records that could not be mapped
+        rejected_sample  [(reason, record)] for the first few rejects (diagnostics)
+
+    Raises DataApiError on any request/envelope failure: the caller must treat that as
+    "unknown", never as "no trades"."""
+    limit = page_limit or ACTIVITY_PAGE_LIMIT
+    cap = max_pages or ACTIVITY_MAX_PAGES
+    # Filters are constant across pages (v2 re-anchors silently if they change).
+    base = {
+        "user": addr,
+        "type": "TRADE",
+        "side": "BUY",
+        "start": int(since_ts),
+        "limit": limit,
+        "sort_by": "TIMESTAMP",
+        "sort_direction": "DESC",
+    }
+    trades = []
+    rejected = {}
+    rejected_sample = []
+    seen_cursors = set()
+    cursor = None
+    pages = 0
+    complete = False
+    truncated = False
+    while pages < cap:
+        params = dict(base)
+        if cursor:
+            params["cursor"] = cursor
+        doc = api_get("/activity", params)
+        items, pagination = unwrap_v2_page(doc, "/v2/activity")
+        pages += 1
+        for rec in items:
+            trade, reason = map_v2_trade(rec, wallet_name, addr)
+            if trade is None:
+                rejected[reason] = rejected.get(reason, 0) + 1
+                if len(rejected_sample) < 5:
+                    rejected_sample.append((reason, rec))
+            else:
+                trades.append(trade)
+        nxt = pagination.get("next_cursor")
+        if not pagination.get("has_more") or not nxt:
+            complete = True
+            break
+        if nxt in seen_cursors:
+            # A cursor that repeats would loop forever. Treat it as a broken response
+            # rather than re-reading the same page as if it were new data.
+            raise DataApiError("/v2/activity: server repeated next_cursor (cursor loop)",
+                               url="/v2/activity")
+        seen_cursors.add(nxt)
+        cursor = nxt
+    else:
+        truncated = True
+    return {"trades": trades, "pages": pages, "complete": complete,
+            "truncated": truncated, "rejected": rejected,
+            "rejected_sample": rejected_sample}
+
+
+
 # ---- config helpers: .env + env-var overrides for tunable constants ----
 # Matches the repo's existing pattern (module-level ALL_CAPS constants edited to fork
 # behavior, e.g. TAKE_PROFIT/STOP_LOSS above) while also letting the values below be
@@ -184,11 +477,16 @@ def _env_bool(name, default):
 
 
 
-def chart_signal(token_id):
+def chart_signal(token_id, condition_id=None):
     """Fetch last 1h of price + volume data for a Polymarket token.
 
     Price (CLOB prices-history): RSI, trend, momentum, volatility, support/resistance.
-    Volume (data-api trades): $ volume, buy pressure, VWAP, vol_ratio.
+      -> unchanged by the v2 migration; CLOB `prices-history` is not a Data API route.
+    Volume (Data API v2 trades): $ volume, buy pressure, VWAP, vol_ratio.
+      -> v1 `/trades?market=`|`?asset=` are gone (410). v2 filters trades by CONDITION,
+         not by token, so the market must be supplied as `condition_id`. Without it the
+         volume gate is skipped (price filters still apply) exactly as before, when the
+         old volume call failed.
     Returns None if price fetch fails or <20 bars. Volume keys absent if trades fail.
     """
     end_ts = int(time.time())
@@ -256,22 +554,33 @@ def chart_signal(token_id):
         "bars": n,
     }
 
-    # --- Volume (data-api trades) ---
-    # Each trade: size = shares, price = $/share → dollar_value = size * price
+    # --- Volume (Data API v2 /trades, filtered by condition) ---
+    # Each trade: size = shares, price = $/share -> dollar_value = size * price
+    # Which calls were retired: v1 `/trades?market=<token>` and `/trades?asset=<token>`
+    # both answer 410 Gone. v2 has no per-token trade filter (the `market` param is
+    # rejected with 400 and an unknown token param is ignored), so we ask for the whole
+    # CONDITION and keep only the rows for this token. v2 also returns its payload in the
+    # `data` envelope, and its window params are ignored on the condition shape: the
+    # newest 500 trades of the market are served, which is what the v1 code effectively
+    # consumed too (it fetched 500 and filtered locally to the last hour).
     try:
         now_ts = int(time.time())
         cutoff_1h  = now_ts - 3600
         cutoff_15m = now_ts - 900
         trades = None
-        for url in [f"{DATA}/trades?market={token_id}&limit=500",
-                    f"{DATA}/trades?asset={token_id}&limit=500"]:
+        if condition_id:
             try:
-                result = get(url)
-                if result and isinstance(result, list) and len(result) > 0:
-                    trades = result
-                    break
+                doc = api_get("/trades", {"condition": condition_id,
+                                          "limit": CHART_VOLUME_TRADE_LIMIT,
+                                          "sort_by": "TIMESTAMP",
+                                          "sort_direction": "DESC"})
+                rows, _ = unwrap_v2_page(doc, "/v2/trades")
+                rows = [t for t in rows
+                        if str(t.get("token_id") or "") == str(token_id)]
+                if rows:
+                    trades = rows
             except Exception:
-                continue
+                trades = None      # volume stays optional; price filters still apply
         if trades:
             def dv(t): return float(t.get("size") or 0) * float(t.get("price") or 0)
             h1 = [t for t in trades if int(t.get("timestamp") or 0) >= cutoff_1h]
@@ -954,36 +1263,62 @@ def _update_trader_cat_stat(c, trader, category, won: bool, pnl: float, source_k
 
 
 def tick():
+    """Detect tracked wallets' new BUYs and record paper copies for models A-E.
+
+    Ingestion reads the Data API v2 activity feed (v1 is retired). One wallet's fetch
+    failure only skips THAT wallet and is reported loudly; it is never rendered as
+    "this wallet had no new trades". Returns a per-run summary dict (used by the
+    workflow to surface fetch failures without touching trading logic)."""
     c = db()
     now = int(time.time())
     added = 0
     skipped_chart = 0
     skipped_filters = 0
     skipped_dupes = 0
+    wallets_ok = 0
+    fetch_failures = []      # [(wallet_name, reason)] — fetch unknown, NOT "no trades"
+    truncated_wallets = []   # [(wallet_name, pages)] — walk stopped by our own cap
+    rejected_total = {}      # {map_v2_trade reason: count} across all wallets
     mkt_cache = {}    # condition_id -> gamma market data
     chart_cache = {}  # asset (token_id) -> chart_signal result
     book_cache = {}   # asset (token_id) -> _fetch_book() result (for entry filters)
     exec_cache = {}   # (asset, exec_ts) -> market price at simulated execution time
     seen_keys = set()  # candidate keys already evaluated in THIS run (duplicate guard)
+    since_ts = now - ACTIVITY_LOOKBACK_SEC
     for name, addr in WALLETS.items():
         try:
-            act = get(f"{DATA}/activity?user={addr}&limit=100")
-        except Exception as e:
-            print(f"  {name}: fetch failed ({e})")
+            feed = fetch_wallet_activity(addr, since_ts, wallet_name=name)
+        except DataApiError as e:
+            # v1 returned 410 for every wallet; v2 failures must never be silently
+            # swallowed into "0 new trades". Report and move on to the next wallet.
+            detail = str(e)
+            if e.status is not None:
+                detail = "HTTP %s%s" % (e.status, (" " + e.code) if e.code else "")
+            fetch_failures.append((name, detail))
+            print(f"  {name}: activity fetch FAILED ({detail}) — no trades read for this wallet")
             continue
-        for a in act:
-            if a.get("type") != "TRADE" or a.get("side") != "BUY":
-                continue
-            if now - int(a.get("timestamp") or 0) > MAX_TRADE_AGE_SEC:
+        except Exception as e:                      # defensive: unknown parse error
+            fetch_failures.append((name, "unexpected error: %s" % (e,)))
+            print(f"  {name}: activity fetch FAILED (unexpected: {e})")
+            continue
+        wallets_ok += 1
+        if feed["truncated"]:
+            truncated_wallets.append((name, feed["pages"]))
+            print(f"  {name}: page cap reached after {feed['pages']} pages "
+                  f"(older trades in this window were not read this run)")
+        for reason, count in feed["rejected"].items():
+            rejected_total[reason] = rejected_total.get(reason, 0) + count
+        for a in feed["trades"]:
+            if now - int(a.get("ts") or 0) > MAX_TRADE_AGE_SEC:
                 continue  # too old — would be look-ahead, skip
             if _is_fast_market(a.get("title")):
                 continue  # resolves faster than our feed lag -> can't copy fairly
             asset = a.get("asset")
-            tx = a.get("transactionHash") or ""
-            cid = a.get("conditionId")
-            oidx = a.get("outcomeIndex") or 0
+            tx = a.get("tx") or ""
+            cid = a.get("condition_id")
+            oidx = a.get("outcome_index")
             their_price = float(a.get("price") or 0)
-            if not asset or not cid:
+            if not asset or not cid or oidx not in (0, 1):
                 continue
             # fetch the market once (cached per tick); ENTRY = current price (same source we
             # mark with) => gain starts at 0, no look-ahead regardless of market speed.
@@ -999,7 +1334,7 @@ def tick():
                 continue
             if entry <= 0.02 or entry >= 0.98:   # already (near) resolved -> no fair copy
                 continue
-            base = f"{tx}:{asset}:{a.get('timestamp')}"
+            base = f"{tx}:{asset}:{a.get('ts')}"
 
             # === Entry / execution simulation (price / slippage / liquidity / lag) ===
             # Per-TRADE, not per-model: a bad entry is bad for every model equally, so we
@@ -1010,7 +1345,7 @@ def tick():
                 continue  # DUPLICATE candidate within this run — never copied twice
             seen_keys.add(base)
             try:
-                source_ts = int(a.get("timestamp"))
+                source_ts = int(a.get("ts"))
             except (TypeError, ValueError):
                 source_ts = None
             if asset not in book_cache:
@@ -1044,7 +1379,7 @@ def tick():
                 hold_ok = False
             # Chart signal (fetched once per asset, cached across this tick run)
             if asset not in chart_cache:
-                chart_cache[asset] = chart_signal(asset)
+                chart_cache[asset] = chart_signal(asset, cid)
             sig = chart_cache[asset]
 
             # === SDD v2 Category + Quality gate (biggest lever) ===
@@ -1064,9 +1399,9 @@ def tick():
                     if not ok:
                         skipped_chart += 1
                         continue  # chart says skip this entry
-                if record_paper_copy(c, base, name, a.get("timestamp"), a.get("conditionId"),
+                if record_paper_copy(c, base, name, a.get("ts"), cid,
                                       asset, a.get("title"), a.get("outcome"),
-                                      a.get("outcomeIndex"), their_price, entry, STAKE,
+                                      oidx, their_price, entry, STAKE,
                                       shares, model, exec_ts=filt["exec_ts"],
                                       market_price=filt["market_price"], fee=filt["fee"]):
                     added += 1
@@ -1074,6 +1409,67 @@ def tick():
     print(f"tick: recorded {added} new paper copies across {len(WALLETS)} wallets "
           f"(chart filtered {skipped_chart} entries, entry-filter rejected "
           f"{skipped_filters} trades, {skipped_dupes} duplicates)")
+    print(f"tick: activity feed — {wallets_ok}/{len(WALLETS)} wallets read OK, "
+          f"{len(fetch_failures)} failed")
+    if rejected_total:
+        print("tick: unmappable v2 records skipped: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(rejected_total.items())))
+    for name, reason in fetch_failures:
+        # GitHub annotation: a failed feed is visible in the run summary, never silent.
+        print(f"::error title=activity-feed-failed::{name}: {reason}")
+    for name, pages in truncated_wallets:
+        print(f"::warning title=activity-page-cap::{name}: stopped after {pages} pages")
+    return {"added": added, "wallets_ok": wallets_ok,
+            "wallets_total": len(WALLETS), "wallets_failed": len(fetch_failures),
+            "fetch_failures": fetch_failures, "truncated": [n for n, _ in truncated_wallets],
+            "rejected": rejected_total, "skipped_chart": skipped_chart,
+            "skipped_filters": skipped_filters, "skipped_dupes": skipped_dupes}
+
+
+def fetch_check():
+    """Read-only migration check: fetch every tracked wallet's v2 activity feed.
+
+    Writes nothing at all — no database, no copies, no dashboard. It exists so the v2
+    migration can be verified against the live API before (and instead of) touching
+    production paper-trading state: every wallet must answer, and the freshest trades it
+    returns are the ones the next tick would consider.
+    """
+    now = int(time.time())
+    since = now - ACTIVITY_LOOKBACK_SEC
+    ok = failed = 0
+    failures = []
+    print(f"\n  v2 activity feed check — {len(WALLETS)} tracked wallets "
+          f"(window {ACTIVITY_LOOKBACK_SEC}s, limit {ACTIVITY_PAGE_LIMIT})")
+    print("  " + "-" * 78)
+    for name, addr in WALLETS.items():
+        try:
+            feed = fetch_wallet_activity(addr, since, wallet_name=name)
+        except DataApiError as e:
+            failed += 1
+            detail = ("HTTP %s%s" % (e.status, (" " + e.code) if e.code else "")
+                      if e.status is not None else str(e))
+            failures.append((name, detail))
+            print(f"  {name:<15} {addr}  FAILED: {detail}")
+            continue
+        except Exception as e:                      # pragma: no cover - defensive
+            failed += 1
+            failures.append((name, "unexpected: %s" % (e,)))
+            print(f"  {name:<15} {addr}  FAILED: unexpected {e}")
+            continue
+        ok += 1
+        trades = feed["trades"]
+        newest = max((t["ts"] for t in trades), default=None)
+        fresh = sum(1 for t in trades if now - t["ts"] <= MAX_TRADE_AGE_SEC)
+        age = ("%dm" % ((now - newest) // 60)) if newest else "-"
+        flag = " TRUNCATED" if feed["truncated"] else ""
+        print(f"  {name:<15} {addr}  trades={len(trades):>3} pages={feed['pages']} "
+              f"copyable_fresh={fresh:>2} newest_age={age}{flag}")
+    print("  " + "-" * 78)
+    print(f"  {ok}/{len(WALLETS)} wallets answered, {failed} failed")
+    if failures:
+        for name, detail in failures:
+            print(f"::error title=activity-feed-failed::{name}: {detail}")
+    return {"ok": ok, "failed": failed, "failures": failures}
 
 
 def _market_by_condition(cid):
@@ -1184,7 +1580,7 @@ def resolve():
             sig = None
             if abs(gain) >= 0.05 and asset:
                 if asset not in chart_cache:
-                    chart_cache[asset] = chart_signal(asset)
+                    chart_cache[asset] = chart_signal(asset, cid)
                 sig = chart_cache[asset]
             if gain <= -CHART_STOP_LOSS:
                 c.execute("UPDATE copies SET status='e_stop',peak=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
@@ -1262,10 +1658,12 @@ def claude_decide():
     now = time.time()
     calls = sold = held = closed = 0
     chart_cache = {}  # asset -> chart_signal, fetched once per unique token this run
-    rows = c.execute("SELECT id,shares,stake,entry,title,outcome,copied_ts,last_check,mark_price,wallet,asset "
+    rows = c.execute("SELECT id,shares,stake,entry,title,outcome,copied_ts,last_check,mark_price,wallet,asset,"
+                     "condition_id "
                      "FROM copies WHERE model='cdecide' AND status='open' AND mark_price IS NOT NULL "
                      "ORDER BY id DESC LIMIT 500").fetchall()
-    for cid_id, shares, stake, entry, title, outcome, copied_ts, last_check, cur, wallet, asset in rows:
+    for (cid_id, shares, stake, entry, title, outcome, copied_ts, last_check, cur, wallet, asset,
+         condition_id) in rows:
         if calls >= MAX_CLAUDE_CALLS_PER_RUN:
             break
         try:
@@ -1295,7 +1693,7 @@ def claude_decide():
         sig = None
         if asset:
             if asset not in chart_cache:
-                chart_cache[asset] = chart_signal(asset)
+                chart_cache[asset] = chart_signal(asset, condition_id)
             sig = chart_cache[asset]
         decision, why = _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet, sig=sig)
         calls += 1
@@ -1541,5 +1939,16 @@ def report():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
-    {"tick": tick, "resolve": resolve, "report": report,
-     "claude_decide": claude_decide, "export": export}.get(cmd, report)()
+    handler = {"tick": tick, "resolve": resolve, "report": report,
+               "claude_decide": claude_decide, "export": export,
+               "fetch_check": fetch_check}.get(cmd, report)
+    result = handler()
+    if cmd == "fetch_check" and isinstance(result, dict) and result["failed"]:
+        sys.exit(1)
+    if cmd == "tick" and isinstance(result, dict):
+        # Partial outages keep the loop alive (the workflow calls `|| true`), but a feed
+        # that failed for EVERY wallet is a hard ingestion failure -> non-zero exit so
+        # it cannot be mistaken for a quiet, healthy run.
+        if result["wallets_total"] and result["wallets_ok"] == 0:
+            print("::error title=activity-feed-down::no wallet activity feed could be read")
+            sys.exit(1)
