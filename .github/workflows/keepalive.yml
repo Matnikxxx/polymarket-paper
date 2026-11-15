@@ -4,8 +4,7 @@ name: keepalive
 # This tiny workflow fires every 30 min and triggers the main copybot via
 # workflow_dispatch — dispatch is more reliable than bare cron.
 on:
-  schedule:
-    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # manual only; automatic keepalive trigger paused
 
 jobs:
   ping:
