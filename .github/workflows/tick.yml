@@ -4,9 +4,7 @@ name: paper-trader-tick
 # strategy's :46 and :53 targets. The dedupe guard in paper_trader.py makes sure
 # the same market is never bet twice, so overlapping/late runs are harmless.
 on:
-  schedule:
-    - cron: "7,37 * * * *"   # backfill is self-healing, so exact timing no longer matters
-  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+  workflow_dispatch: {}   # manual runs only; scheduled runs paused to conserve Actions minutes
 
 permissions:
   contents: write   # so the job can publish any tracked change it produced
