@@ -5,9 +5,7 @@ name: weekly-report-reminder
 # push-notifies the repo owner on a new issue, so this reaches your phone even
 # if your laptop is closed/offline/traveling.
 on:
-  schedule:
-    - cron: "0 9 14 6 *"   # 09:00 UTC, June 14
-  workflow_dispatch: {}     # also runnable on demand
+  workflow_dispatch: {}     # manual only; scheduled trigger paused
 
 permissions:
   contents: read
