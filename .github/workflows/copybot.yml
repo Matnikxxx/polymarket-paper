@@ -3,10 +3,7 @@ name: copybot-tick
 # Forward-tests copying vetted traders. tick (detect fresh buys) is fast; resolve
 # (settle/mark) is bounded per run. Self-healing — missed runs lose nothing.
 on:
-  schedule:
-    - cron: "11 * * * *"   # two offset triggers so a dropped GitHub run never leaves a
-    - cron: "41 * * * *"   # full-hour gap; concurrency queues them for near-continuous cover
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # manual runs only; scheduled runs paused to conserve Actions minutes
 
 permissions:
   contents: write
